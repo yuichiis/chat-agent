@@ -408,7 +408,21 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
       let history = conversations.get(room.roomId);
       if (!history) { history = [{ role: "system", content: systemPrompt }]; conversations.set(room.roomId, history); }
       history.push({ role: "user", content: prompt });
+      const typingTimeoutMs = 30_000;
+      let typingStarted = false;
+      let typingRefresh: NodeJS.Timeout | undefined;
       try {
+        try {
+          await client.sendTyping(room.roomId, true, typingTimeoutMs);
+          typingStarted = true;
+          typingRefresh = setInterval(() => {
+            void client.sendTyping(room.roomId, true, typingTimeoutMs).catch((error: unknown) => {
+              console.warn(`[${room.name || room.roomId}] 入力中表示の更新に失敗しました: ${error instanceof Error ? error.message : String(error)}`);
+            });
+          }, 20_000);
+        } catch (error) {
+          console.warn(`[${room.name || room.roomId}] 入力中表示を開始できません: ${error instanceof Error ? error.message : String(error)}`);
+        }
         const answer = await streamOpenAI(history, () => undefined);
         history.push({ role: "assistant", content: answer });
         await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: answer });
@@ -418,6 +432,13 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
         const message = error instanceof Error ? error.message : String(error);
         console.error(`LLM/Matrix reply failed: ${message}`);
         await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: "すみません。LLM への接続中にエラーが発生しました。" }).catch(console.error);
+      } finally {
+        if (typingRefresh) clearInterval(typingRefresh);
+        if (typingStarted) {
+          await client.sendTyping(room.roomId, false, typingTimeoutMs).catch((error: unknown) => {
+            console.warn(`[${room.name || room.roomId}] 入力中表示の解除に失敗しました: ${error instanceof Error ? error.message : String(error)}`);
+          });
+        }
       }
     }).catch((error: unknown) => {
       console.error(`[${room.name || room.roomId}] メッセージ処理に失敗しました: ${error instanceof Error ? error.message : String(error)}`);
