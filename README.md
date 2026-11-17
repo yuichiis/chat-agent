@@ -32,6 +32,8 @@ Create a separate Matrix account for the agent, then run the service. The first 
 
 Invite the agent account shown at startup to a room, or start a direct chat with it from your phone. Responses are sent back to the same room. Per-room conversation context is held in memory for the lifetime of the service.
 
+Messages sent before the current service process starts are ignored. Eligible new messages receive an `👀` reaction before processing; if the agent already reacted with `👀`, it skips that message.
+
 The OAuth client registration ID is cached under `data/matrix-client.json`. Access and refresh tokens are stored in `data/matrix-session.json`, and the E2EE IndexedDB state is snapshotted to `data/matrix-crypto-<device-id>.bin`. These files are ignored by Git and created with owner-only permissions where supported. On restart, the service refreshes the saved token and restores the same encrypted device; if the refresh token is revoked or the crypto snapshot is missing, it starts device authorization again. Keep the `data` directory private and include it in backups if you need to preserve the Matrix device.
 
 ## Configuration

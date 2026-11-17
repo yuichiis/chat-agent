@@ -11,6 +11,7 @@ import { VerificationPhase, VerificationRequestEvent, VerifierEvent } from "../n
 import type { ShowSasCallbacks } from "../node_modules/matrix-js-sdk/lib/crypto-api/verification.js";
 import type { Logger } from "../node_modules/matrix-js-sdk/lib/logger.js";
 import { logger as matrixGlobalLogger } from "../node_modules/matrix-js-sdk/lib/logger.js";
+import { RelationType } from "../node_modules/matrix-js-sdk/lib/@types/event.js";
 import type { ChatMessage } from "./openai.js";
 import { openAISettings, streamOpenAI } from "./openai.js";
 
@@ -296,6 +297,7 @@ async function login(sdkLogger: Logger) {
 
 export async function runMatrixService(options: { debug?: boolean } = {}): Promise<void> {
   const debug = options.debug ?? false;
+  const serviceStartedAt = Date.now();
   filterSdkConsole(debug);
   (matrixGlobalLogger as unknown as { setLevel(level: string): void }).setLevel(debug ? "debug" : "warn");
   const sdkLogger = createSdkLogger(debug);
@@ -350,8 +352,23 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
   const seen = new Set<string>();
   const decryptWarningAt = new Map<string, number>();
   const queues = new Map<string, Promise<void>>();
+  const hasOwnEyesReaction = async (roomId: string, eventId: string): Promise<boolean> => {
+    let from: string | undefined;
+    do {
+      const page = await client.relations(roomId, eventId, "m.annotation", EventType.Reaction, { from, limit: 100 });
+      if (page.events.some((relation) => {
+        if (relation.getSender() !== session.userId) return false;
+        const relationContent = relation.getContent<{ "m.relates_to"?: { key?: string } }>();
+        return relationContent["m.relates_to"]?.key === "👀";
+      })) return true;
+      if (!page.nextBatch || page.nextBatch === from) return false;
+      from = page.nextBatch;
+    } while (from);
+    return false;
+  };
   const handleMessage = (event: import("matrix-js-sdk").MatrixEvent, room: import("matrix-js-sdk").Room | undefined) => {
     if (event.getType() !== EventType.RoomMessage) return;
+    if (event.getTs() <= serviceStartedAt) return;
     if (event.getSender() === session.userId) return;
     const content = event.getContent<{
       msgtype?: string;
@@ -375,6 +392,18 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
 
     const prior = queues.get(room.roomId) ?? Promise.resolve();
     const task = prior.then(async () => {
+      if (!eventId) {
+        console.warn(`[${room.name || room.roomId}] event IDがないため処理をスキップしました。`);
+        return;
+      }
+      if (await hasOwnEyesReaction(room.roomId, eventId)) {
+        console.log(`[${room.name || room.roomId}] 既に👀リアクションがあるためスキップしました。`);
+        return;
+      }
+      await client.sendEvent(room.roomId, EventType.Reaction, {
+        "m.relates_to": { rel_type: RelationType.Annotation, event_id: eventId, key: "👀" },
+      });
+      console.log(`[${room.name || room.roomId}] 👀を付けて処理します。`);
       console.log(`[${room.name || room.roomId}] ${joinedMemberCount}人 · ${event.getSender()}: ${prompt}`);
       let history = conversations.get(room.roomId);
       if (!history) { history = [{ role: "system", content: systemPrompt }]; conversations.set(room.roomId, history); }
@@ -390,7 +419,9 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
         console.error(`LLM/Matrix reply failed: ${message}`);
         await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: "すみません。LLM への接続中にエラーが発生しました。" }).catch(console.error);
       }
-    }).catch(console.error);
+    }).catch((error: unknown) => {
+      console.error(`[${room.name || room.roomId}] メッセージ処理に失敗しました: ${error instanceof Error ? error.message : String(error)}`);
+    });
     queues.set(room.roomId, task);
   };
 
