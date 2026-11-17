@@ -15,7 +15,6 @@ import type { ChatMessage } from "./openai.js";
 import { openAISettings, streamOpenAI } from "./openai.js";
 
 const homeserver = (process.env.MATRIX_HOMESERVER_URL ?? "https://matrix.org").replace(/\/+$/, "");
-const trigger = process.env.MATRIX_TRIGGER ?? "!ai ";
 const systemPrompt = process.env.SYSTEM_PROMPT ?? "You are a helpful assistant.";
 const dataDir = resolve(dirname(fileURLToPath(import.meta.url)), "../data");
 const clientInfoPath = resolve(dataDir, "matrix-client.json");
@@ -31,6 +30,18 @@ type MatrixSession = {
 };
 type StoreSnapshot = { name: string; keyPath: IDBObjectStoreParameters["keyPath"]; autoIncrement: boolean; indexes: Array<{ name: string; keyPath: string | string[]; multiEntry: boolean; unique: boolean }>; records: Array<{ key: IDBValidKey; value: unknown }> };
 type DatabaseSnapshot = { name: string; version: number; stores: StoreSnapshot[] };
+
+function containsUserIdMention(text: string, userId: string): boolean {
+  let offset = text.indexOf(userId);
+  while (offset >= 0) {
+    const before = offset === 0 || /[\s([<{]/u.test(text[offset - 1] ?? "");
+    const afterIndex = offset + userId.length;
+    const after = afterIndex === text.length || /[\s.,!?;:)\]}>]/u.test(text[afterIndex] ?? "");
+    if (before && after) return true;
+    offset = text.indexOf(userId, offset + userId.length);
+  }
+  return false;
+}
 
 function requestResult<T>(request: IDBRequest<T>): Promise<T> {
   return new Promise((resolveRequest, rejectRequest) => {
@@ -290,7 +301,7 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
   const sdkLogger = createSdkLogger(debug);
   console.log(`Matrix サービスを開始します (${homeserver})`);
   console.log(`LLM: ${openAISettings.baseUrl} · ${openAISettings.model}`);
-  console.log(`反応プレフィックス: ${JSON.stringify(trigger)}`);
+  console.log("応答条件: 参加中メンバー2人以下は他の人の投稿、3人以上はエージェントへのメンション");
   console.log(debug ? "デバッグログ: 有効" : "デバッグログ: 無効（--debug で有効）");
   console.log("起動後のコマンド: /verify（この端末を認証）, /help。終了: Ctrl+C");
 
@@ -342,22 +353,29 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
   const handleMessage = (event: import("matrix-js-sdk").MatrixEvent, room: import("matrix-js-sdk").Room | undefined) => {
     if (event.getType() !== EventType.RoomMessage) return;
     if (event.getSender() === session.userId) return;
-    const content = event.getContent<{ msgtype?: string; body?: string }>();
+    const content = event.getContent<{
+      msgtype?: string;
+      body?: string;
+      formatted_body?: string;
+      "m.mentions"?: { user_ids?: string[] };
+    }>();
     if (content.msgtype !== "m.text" || !content.body || !room) return;
-    const body = content.body.trimStart();
-    const triggerText = trigger.trimEnd();
-    const afterTrigger = body.slice(triggerText.length);
-    const matchesTrigger = body === triggerText || (body.startsWith(triggerText) && /^\s/u.test(afterTrigger));
-    if (!matchesTrigger) return;
+    const joinedMemberCount = room.getJoinedMemberCount();
+    const mentionedViaMetadata = content["m.mentions"]?.user_ids?.includes(session.userId) ?? false;
+    const mentionedInBody = containsUserIdMention(content.body, session.userId)
+      || content.formatted_body?.includes(`matrix.to/#/${session.userId}`)
+      || content.formatted_body?.includes(`matrix.to/#/${encodeURIComponent(session.userId)}`)
+      || false;
+    if (joinedMemberCount > 2 && !mentionedViaMetadata && !mentionedInBody) return;
     const eventId = event.getId();
     if (eventId && seen.has(eventId)) return;
     if (eventId) seen.add(eventId);
-    const prompt = afterTrigger.trim();
+    const prompt = content.body.trim();
     if (!prompt) return;
 
     const prior = queues.get(room.roomId) ?? Promise.resolve();
     const task = prior.then(async () => {
-      console.log(`[${room.name || room.roomId}] ${event.getSender()}: ${prompt}`);
+      console.log(`[${room.name || room.roomId}] ${joinedMemberCount}人 · ${event.getSender()}: ${prompt}`);
       let history = conversations.get(room.roomId);
       if (!history) { history = [{ role: "system", content: systemPrompt }]; conversations.set(room.roomId, history); }
       history.push({ role: "user", content: prompt });
@@ -399,7 +417,7 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
 
   client.on(ClientEvent.Sync, (state) => {
     if (state === SyncState.Prepared) {
-      console.log(`接続しました: ${session.userId} · 参加中のルームで ${JSON.stringify(trigger)} から始まるメッセージを送ってください。`);
+      console.log(`接続しました: ${session.userId} · 少人数ルームでは通常投稿、大人数ルームではエージェントへのメンションに応答します。`);
       void persistCrypto();
     }
     else if (state === SyncState.Error) console.error("Matrix 同期エラー。再接続を試みます。");

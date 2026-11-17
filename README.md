@@ -24,10 +24,10 @@ Use `/clear` to reset conversation history and `/exit` to quit.
 npm.cmd run service
 ```
 
-Create a separate Matrix account for the agent, then run the service. The first run uses Matrix OAuth device authorization. Follow the verification URL and approve the login in a browser. The service then syncs its joined rooms and replies to messages that start with `!ai `, for example:
+Create a separate Matrix account for the agent, then run the service. The first run uses Matrix OAuth device authorization. Follow the verification URL and approve the login in a browser. The service syncs its joined rooms and replies to every other user's message in rooms with at most two joined members. In rooms with three or more joined members, use Element's mention picker to mention the agent; it replies only to mentioned messages. For example, in a two-person room:
 
 ```text
-!ai Summarize the latest news I pasted here.
+こんにちは
 ```
 
 Invite the agent account shown at startup to a room, or start a direct chat with it from your phone. Responses are sent back to the same room. Per-room conversation context is held in memory for the lifetime of the service.
@@ -44,6 +44,5 @@ The OAuth client registration ID is cached under `data/matrix-client.json`. Acce
 | `SYSTEM_PROMPT` | `You are a helpful assistant.` | LLM system message |
 | `MATRIX_HOMESERVER_URL` | `https://matrix.org` | Matrix homeserver URL |
 | `MATRIX_OAUTH_CLIENT_ID` | auto registered and cached | Optional pre-registered OAuth client ID |
-| `MATRIX_TRIGGER` | `!ai ` | Prefix required to send a room message to the LLM |
 
 Matrix.org accounts are managed through Matrix Authentication Service (OAuth); this client uses the SDK's OAuth device flow. Other homeservers must support OAuth device authorization for this sign-in mode.
