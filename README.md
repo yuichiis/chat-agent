@@ -18,6 +18,8 @@ Use `/clear` to reset conversation history and `/exit` to quit.
 
 ## Element / Matrix service
 
+詳しいアカウント作成、初回ログイン、端末認証、暗号化ルームでの利用、トラブル対応は[Matrix セットアップガイド](docs/matrix-setup.md)を参照してください。
+
 ```powershell
 npm.cmd run service
 ```
