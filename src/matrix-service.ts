@@ -9,6 +9,8 @@ import { stdin, stdout } from "node:process";
 import { ClientEvent, EventType, MatrixEventEvent, MsgType, OAuth2, RoomEvent, SyncState, createClient } from "matrix-js-sdk";
 import { VerificationPhase, VerificationRequestEvent, VerifierEvent } from "../node_modules/matrix-js-sdk/lib/crypto-api/verification.js";
 import type { ShowSasCallbacks } from "../node_modules/matrix-js-sdk/lib/crypto-api/verification.js";
+import type { Logger } from "../node_modules/matrix-js-sdk/lib/logger.js";
+import { logger as matrixGlobalLogger } from "../node_modules/matrix-js-sdk/lib/logger.js";
 import type { ChatMessage } from "./openai.js";
 import { openAISettings, streamOpenAI } from "./openai.js";
 
@@ -170,8 +172,61 @@ async function getOAuthClientId(metadata: Awaited<ReturnType<ReturnType<typeof c
   return clientId;
 }
 
-async function login() {
-  const discoveryClient = createClient({ baseUrl: homeserver });
+function createSdkLogger(debug: boolean, namespace = "Matrix"): Logger {
+  const shortText = (args: unknown[]) => args.map((value) => value instanceof Error ? value.message : typeof value === "string" ? value : (() => {
+    if (value && typeof value === "object") {
+      const item = value as { message?: unknown; error?: unknown; errcode?: unknown };
+      if (typeof item.message === "string") return item.message;
+      if (typeof item.error === "string") return item.error;
+      if (typeof item.errcode === "string") return item.errcode;
+    }
+    return String(value);
+  })()).join(" ").slice(0, 500);
+  const emit = (level: "trace" | "debug" | "info" | "warn" | "error", args: unknown[]) => {
+    if (debug) console[level](`[${namespace}]`, ...args);
+    else if (level === "warn" || level === "error") console[level](`[${namespace}] ${shortText(args)}`);
+  };
+  return {
+    trace: (...args) => emit("trace", args),
+    debug: (...args) => emit("debug", args),
+    info: (...args) => emit("info", args),
+    warn: (...args) => emit("warn", args),
+    error: (...args) => emit("error", args),
+    getChild: (child) => createSdkLogger(debug, `${namespace}/${child}`),
+  };
+}
+
+function filterSdkConsole(debug: boolean): void {
+  if (debug) return;
+  const originalLog = console.log.bind(console);
+  const originalWarn = console.warn.bind(console);
+  const originalError = console.error.bind(console);
+  const stderr = process.stderr as unknown as { write: (chunk: unknown, ...args: unknown[]) => boolean };
+  const originalStderrWrite = stderr.write.bind(process.stderr);
+  const noisy = /^(?:FetchHttpApi:|OAuth2:|DEBUG matrix_sdk_|INFO matrix_sdk_|WARN matrix_sdk_|\[Matrix\] (?:WARN )?matrix_sdk_|\[Perf\]:|sync |Attempting to |Checking capabilites|Checking capabilities|PollingCachedValue|Missing default global|Adding default global|\[RustBackupManager\]|\[PerSessionKeyBackupDownloader\]|\[MatrixRTCSession )/;
+  console.debug = () => undefined;
+  console.info = () => undefined;
+  console.log = (...args: unknown[]) => {
+    if (typeof args[0] === "string" && noisy.test(args[0])) return;
+    originalLog(...args);
+  };
+  console.warn = (...args: unknown[]) => {
+    if (typeof args[0] === "string" && (noisy.test(args[0]) || args[0].startsWith("[Matrix] Missing default global") || args[0].startsWith("[Matrix] Adding default global"))) return;
+    originalWarn(...args);
+  };
+  console.error = (...args: unknown[]) => {
+    if (typeof args[0] === "string" && (/^Error decrypting event \(/.test(args[0]) || noisy.test(args[0]))) return;
+    originalError(...args);
+  };
+  stderr.write = (chunk: unknown, ...args: unknown[]) => {
+    const text = typeof chunk === "string" ? chunk : chunk instanceof Uint8Array ? Buffer.from(chunk).toString("utf8") : "";
+    if (/Error decrypting event \(/.test(text)) return true;
+    return originalStderrWrite(chunk, ...args);
+  };
+}
+
+async function login(sdkLogger: Logger) {
+  const discoveryClient = createClient({ baseUrl: homeserver, logger: sdkLogger });
   const metadata = await discoveryClient.getAuthMetadata();
   if (!metadata.device_authorization_endpoint) {
     throw new Error("このホームサーバーは OAuth デバイス認証に対応していません。");
@@ -186,7 +241,7 @@ async function login() {
       try {
         const oauth = new OAuth2(metadata, { clientId: saved.clientId, deviceId: saved.deviceId });
         const refreshed = await oauth.performRefreshTokenGrant(saved.refreshToken);
-        const identity = await createClient({ baseUrl: homeserver, accessToken: refreshed.access_token, deviceId: saved.deviceId }).whoami();
+        const identity = await createClient({ baseUrl: homeserver, accessToken: refreshed.access_token, deviceId: saved.deviceId, logger: sdkLogger }).whoami();
         if (identity.user_id !== saved.userId) throw new Error("更新後の Matrix セッションが保存済みアカウントと一致しません。");
         const session: MatrixSession = {
           ...saved,
@@ -213,7 +268,7 @@ async function login() {
   const result = await oauth.waitForDeviceAuthorizationGrant(deviceSession);
   if (!("access_token" in result)) throw new Error(`OAuth 認証に失敗しました: ${result.error}`);
 
-  const client = createClient({ baseUrl: homeserver, accessToken: result.access_token, deviceId: oauth.context.deviceId });
+  const client = createClient({ baseUrl: homeserver, accessToken: result.access_token, deviceId: oauth.context.deviceId, logger: sdkLogger });
   const identity = await client.whoami();
   if (!result.refresh_token) throw new Error("Matrix OAuth サーバーから refresh token が返されませんでした。");
   const session: MatrixSession = {
@@ -228,13 +283,18 @@ async function login() {
   return session;
 }
 
-export async function runMatrixService(): Promise<void> {
+export async function runMatrixService(options: { debug?: boolean } = {}): Promise<void> {
+  const debug = options.debug ?? false;
+  filterSdkConsole(debug);
+  (matrixGlobalLogger as unknown as { setLevel(level: string): void }).setLevel(debug ? "debug" : "warn");
+  const sdkLogger = createSdkLogger(debug);
   console.log(`Matrix サービスを開始します (${homeserver})`);
   console.log(`LLM: ${openAISettings.baseUrl} · ${openAISettings.model}`);
   console.log(`反応プレフィックス: ${JSON.stringify(trigger)}`);
-  console.log("初回は Matrix アカウントをブラウザで承認してください。終了は Ctrl+C。\n");
+  console.log(debug ? "デバッグログ: 有効" : "デバッグログ: 無効（--debug で有効）");
+  console.log("起動後のコマンド: /verify（この端末を認証）, /help。終了: Ctrl+C");
 
-  const session = await login();
+  const session = await login(sdkLogger);
   const cryptoPrefix = `openai-matrix-${session.deviceId}`;
   const cryptoSnapshotPath = resolve(dataDir, `matrix-crypto-${session.deviceId}.bin`);
   const restoredCrypto = await restoreCryptoDatabases(cryptoPrefix, cryptoSnapshotPath);
@@ -249,6 +309,7 @@ export async function runMatrixService(): Promise<void> {
     accessToken: session.accessToken,
     refreshToken: session.refreshToken,
     oauthClientId: session.clientId,
+    logger: sdkLogger,
     onTokenRefresh: (tokens) => {
       sessionToPersist = {
         ...sessionToPersist,
@@ -276,6 +337,7 @@ export async function runMatrixService(): Promise<void> {
 
   const conversations = new Map<string, ChatMessage[]>();
   const seen = new Set<string>();
+  const decryptWarningAt = new Map<string, number>();
   const queues = new Map<string, Promise<void>>();
   const handleMessage = (event: import("matrix-js-sdk").MatrixEvent, room: import("matrix-js-sdk").Room | undefined) => {
     if (event.getType() !== EventType.RoomMessage) return;
@@ -286,7 +348,6 @@ export async function runMatrixService(): Promise<void> {
     const triggerText = trigger.trimEnd();
     const afterTrigger = body.slice(triggerText.length);
     const matchesTrigger = body === triggerText || (body.startsWith(triggerText) && /^\s/u.test(afterTrigger));
-    console.log(`[${room.name || room.roomId}] incoming message from ${event.getSender()} (${matchesTrigger ? "trigger matched" : "ignored"})`);
     if (!matchesTrigger) return;
     const eventId = event.getId();
     if (eventId && seen.has(eventId)) return;
@@ -324,7 +385,12 @@ export async function runMatrixService(): Promise<void> {
     if (event.getWireType() !== EventType.RoomMessageEncrypted) return;
     event.once(MatrixEventEvent.Decrypted, (decryptedEvent, error) => {
       if (error || decryptedEvent.isDecryptionFailure()) {
-        console.error(`[${room?.name || room?.roomId || event.getRoomId()}] encrypted message could not be decrypted: ${error?.message ?? decryptedEvent.decryptionFailureReason ?? "unknown error"}`);
+        const roomLabel = room?.name || room?.roomId || event.getRoomId() || "Matrix room";
+        const now = Date.now();
+        if (now - (decryptWarningAt.get(roomLabel) ?? 0) > 60_000) {
+          decryptWarningAt.set(roomLabel, now);
+          console.warn(`[${roomLabel}] 過去の暗号化メッセージを復号できません。新しい投稿は受信できます。詳細は --debug で確認できます。`);
+        }
         return;
       }
       handleMessage(decryptedEvent, room);
@@ -333,7 +399,7 @@ export async function runMatrixService(): Promise<void> {
 
   client.on(ClientEvent.Sync, (state) => {
     if (state === SyncState.Prepared) {
-      console.log(`接続しました: ${session.userId} · Element から ${JSON.stringify(trigger)}で話しかけてください。`);
+      console.log(`接続しました: ${session.userId} · 参加中のルームで ${JSON.stringify(trigger)} から始まるメッセージを送ってください。`);
       void persistCrypto();
     }
     else if (state === SyncState.Error) console.error("Matrix 同期エラー。再接続を試みます。");
@@ -343,6 +409,7 @@ export async function runMatrixService(): Promise<void> {
 
   const rl = readline.createInterface({ input: stdin, output: stdout, terminal: true });
   let verificationRunning = false;
+  let sasAnswer: ((answer: string) => void) | undefined;
   const verifyThisDevice = async () => {
     if (verificationRunning) { console.log("Verification is already in progress."); return; }
     verificationRunning = true;
@@ -350,7 +417,7 @@ export async function runMatrixService(): Promise<void> {
       const crypto = client.getCrypto();
       if (!crypto) throw new Error("Matrix crypto is not initialized.");
       const request = await crypto.requestOwnUserVerification();
-      console.log("Accept the verification request on a verified Element session; waiting...");
+      console.log("認証済みのElementセッションで、エージェント端末への認証要求を承認してください。承認を待っています…");
       if (request.phase !== VerificationPhase.Ready) {
         await new Promise<void>((resolveReady, rejectReady) => {
           const onChange = () => {
@@ -363,29 +430,44 @@ export async function runMatrixService(): Promise<void> {
       }
       const verifier = await request.startVerification("m.sas.v1");
       const verification = verifier.verify();
+      void verification.catch(() => undefined);
       const sas = await new Promise<ShowSasCallbacks>((resolveSas, rejectSas) => {
         verifier.once(VerifierEvent.ShowSas, resolveSas);
         verifier.once(VerifierEvent.Cancel, (error) => rejectSas(error instanceof Error ? error : new Error("Verification cancelled.")));
       });
-      console.log("\nCompare the emoji/numbers below with Element. Confirm only if they match:");
+      console.log("\nElement側と次の絵文字・数字を照合してください。一致する場合のみ y を入力します。");
       if (sas.sas.emoji) console.log(sas.sas.emoji.map(([emoji, name]) => `${emoji} ${name}`).join(" · "));
       if (sas.sas.decimal) console.log(sas.sas.decimal.join(" · "));
-      const answer = await rl.question("Do they match? [y/N] ");
+      const answer = await new Promise<string>((resolveAnswer) => {
+        sasAnswer = resolveAnswer;
+        stdout.write("一致していますか？ [y/N] ");
+      });
+      sasAnswer = undefined;
       if (/^y(es)?$/i.test(answer.trim())) await sas.confirm();
       else sas.mismatch();
       await verification;
-      console.log("Device verification complete. Refresh Element's sessions page.");
+      console.log("端末認証が完了しました。Elementのセッション画面を更新してください。");
       void persistCrypto();
     } catch (error) {
-      console.error("Device verification failed:", error instanceof Error ? error.message : String(error));
+      console.error(`端末認証に失敗しました: ${error instanceof Error ? error.message : String(error)}`);
     } finally { verificationRunning = false; }
   };
-  void (async () => {
-    for await (const line of rl) {
-      if (line.trim() === "/verify") void verifyThisDevice();
-      else if (line.trim() === "/help") console.log("Commands: /verify (verify this agent device), /help");
+  console.log("\nコマンドを入力してください: /verify または /help");
+  stdout.write("matrix> ");
+  rl.on("line", (line) => {
+    if (sasAnswer) {
+      const answer = sasAnswer;
+      sasAnswer = undefined;
+      answer(line);
+    } else if (line.trim() === "/verify") {
+      void verifyThisDevice();
+    } else if (line.trim() === "/help") {
+      console.log("/verify  このエージェント端末をElementの認証済み端末と照合\n/help     コマンド一覧\nCtrl+C    サービス終了");
+    } else if (line.trim()) {
+      console.log("コマンドが分かりません。/help で一覧を表示します。");
     }
-  })().catch(console.error);
+    if (!sasAnswer) stdout.write("matrix> ");
+  });
 
   const snapshotTimer = setInterval(() => { void persistCrypto(); }, 20_000);
   const stop = async () => {

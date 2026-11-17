@@ -34,6 +34,6 @@ async function runTui() {
 }
 
 const mode = process.argv[2] ?? "tui";
-if (mode === "service") await runMatrixService();
+if (mode === "service") await runMatrixService({ debug: process.argv.includes("--debug") });
 else if (mode === "tui") await runTui();
-else { console.error("使い方: npm start -- [tui|service]"); process.exitCode = 2; }
+else { console.error("使い方: npm start -- [tui|service] [--debug]"); process.exitCode = 2; }
