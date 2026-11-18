@@ -5,15 +5,42 @@ const baseUrl = (process.env.OPENAI_BASE_URL ?? "http://127.0.0.1:9931").replace
 const endpoint = `${baseUrl}/v1/chat/completions`;
 const model = process.env.OPENAI_MODEL ?? "local-model";
 const apiKey = process.env.OPENAI_API_KEY;
+const configuredStartupWaitSeconds = Number(process.env.OPENAI_STARTUP_WAIT_SECONDS ?? 120);
+const startupWaitSeconds = Number.isInteger(configuredStartupWaitSeconds) && configuredStartupWaitSeconds >= 0
+  ? configuredStartupWaitSeconds
+  : 120;
+if (startupWaitSeconds !== configuredStartupWaitSeconds) {
+  console.warn("OPENAI_STARTUP_WAIT_SECONDS は0以上の整数で指定してください。120秒を使います。");
+}
 
-export async function streamOpenAI(messages: ChatMessage[], onToken: (text: string) => void = (text) => stdout.write(text)): Promise<string> {
+export async function streamOpenAI(
+  messages: ChatMessage[],
+  onToken: (text: string) => void = (text) => stdout.write(text),
+  onServerStarting: (waitSeconds: number) => void | Promise<void> = (waitSeconds) => { stdout.write(`\nLLMサーバーを起動しています。${waitSeconds}秒待って再試行します…\n`); },
+): Promise<string> {
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (apiKey) headers.authorization = `Bearer ${apiKey}`;
-  const response = await fetch(endpoint, {
+  const request = () => fetch(endpoint, {
     method: "POST", headers,
     body: JSON.stringify({ model, messages, stream: true }),
     signal: AbortSignal.timeout(600_000),
   });
+  let response = await request();
+  if (response.status === 503) {
+    const errorBody = await response.text();
+    let noUpstreamsAvailable = false;
+    try {
+      const payload = JSON.parse(errorBody) as { error?: unknown };
+      noUpstreamsAvailable = payload.error === "no upstreams available";
+    } catch { /* keep the server's original error below */ }
+    if (noUpstreamsAvailable) {
+      await onServerStarting(startupWaitSeconds);
+      await new Promise((resolveWait) => setTimeout(resolveWait, startupWaitSeconds * 1000));
+      response = await request();
+    } else {
+      throw new Error(`OpenAI API HTTP 503: ${errorBody}`);
+    }
+  }
   if (!response.ok) throw new Error(`OpenAI API HTTP ${response.status}: ${await response.text()}`);
   if (!response.body) throw new Error("レスポンス本文がありません。");
   const reader = response.body.getReader();
@@ -38,4 +65,4 @@ export async function streamOpenAI(messages: ChatMessage[], onToken: (text: stri
   return answer;
 }
 
-export const openAISettings = { baseUrl, model };
+export const openAISettings = { baseUrl, model, startupWaitSeconds };

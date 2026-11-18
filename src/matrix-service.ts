@@ -303,6 +303,7 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
   const sdkLogger = createSdkLogger(debug);
   console.log(`Matrix サービスを開始します (${homeserver})`);
   console.log(`LLM: ${openAISettings.baseUrl} · ${openAISettings.model}`);
+  console.log(`オンデマンド起動待ち: ${openAISettings.startupWaitSeconds}秒`);
   console.log("応答条件: 参加中メンバー2人以下は他の人の投稿、3人以上はエージェントへのメンション");
   console.log(debug ? "デバッグログ: 有効" : "デバッグログ: 無効（--debug で有効）");
   console.log("起動後のコマンド: /verify（この端末を認証）, /help。終了: Ctrl+C");
@@ -423,7 +424,13 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
         } catch (error) {
           console.warn(`[${room.name || room.roomId}] 入力中表示を開始できません: ${error instanceof Error ? error.message : String(error)}`);
         }
-        const answer = await streamOpenAI(history, () => undefined);
+        const answer = await streamOpenAI(history, () => undefined, async (waitSeconds) => {
+          const startupNotice = `LLMサーバーを起動しています。約${waitSeconds}秒後に自動で再試行します。`;
+          console.log(`[${room.name || room.roomId}] ${startupNotice}`);
+          await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: startupNotice }).catch((error: unknown) => {
+            console.warn(`[${room.name || room.roomId}] 起動待ちメッセージを送信できません: ${error instanceof Error ? error.message : String(error)}`);
+          });
+        });
         history.push({ role: "assistant", content: answer });
         await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: answer });
         console.log("  -> replied");

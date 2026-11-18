@@ -22,6 +22,7 @@ npm.cmd install
 ```powershell
 $env:OPENAI_BASE_URL = "http://127.0.0.1:9931"
 $env:OPENAI_MODEL = "local-model"
+$env:OPENAI_STARTUP_WAIT_SECONDS = "120"
 ```
 
 認証が必要な OpenAI 互換サーバーでは、API キーを設定します。
@@ -31,6 +32,8 @@ $env:OPENAI_API_KEY = "your-api-key"
 ```
 
 `OPENAI_BASE_URL` には `/v1` を含めません。クライアントは `/v1/chat/completions` を付けてアクセスします。環境変数は設定した PowerShell のプロセスにだけ適用されます。
+
+オンデマンド起動のLLMサーバーがHTTP 503と `no upstreams available` を返したときの再試行待ち時間は、`OPENAI_STARTUP_WAIT_SECONDS` で秒単位に設定できます。既定値は120秒です。0以上の整数を指定します。
 
 ## 3. エージェント用アカウントを用意する
 
@@ -79,6 +82,8 @@ npm.cmd run service -- --debug
 起動前に送られた過去の投稿は読み込まれても処理しません。応答条件に合う新着投稿には、LLM処理の前にエージェントが `👀` リアクションを付けます。対象投稿にエージェント自身の `👀` が既にある場合は、重複処理を避けるため読み飛ばします。
 
 LLMの応答生成中はElementに入力中表示を送り、長時間の生成では通知を定期更新します。返信またはエラーを送った後に入力中表示を解除します。
+
+オンデマンド起動のLLMサーバーがHTTP 503と `no upstreams available` を返した場合、ルームに起動中の案内を送り、`OPENAI_STARTUP_WAIT_SECONDS` の秒数（既定120秒）待って同じリクエストを1回再試行します。再試行も失敗した場合は通常のエラー応答になります。
 
 ルームごとの会話履歴はサービスのメモリ上に保持され、再起動すると消えます。
 
