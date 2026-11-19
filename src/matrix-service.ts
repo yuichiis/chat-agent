@@ -305,6 +305,7 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
   console.log(`LLM: ${openAISettings.baseUrl} · ${openAISettings.model}`);
   console.log(`オンデマンド起動待ち: ${openAISettings.startupWaitSeconds}秒`);
   console.log("応答条件: 参加中メンバー2人以下は他の人の投稿、3人以上はエージェントへのメンション");
+  console.log("Matrixコマンド: /new（会話をリセット）, /status（会話履歴を表示）");
   console.log(debug ? "デバッグログ: 有効" : "デバッグログ: 無効（--debug で有効）");
   console.log("起動後のコマンド: /verify（この端末を認証）, /help。終了: Ctrl+C");
 
@@ -406,6 +407,23 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
       });
       console.log(`[${room.name || room.roomId}] 👀を付けて処理します。`);
       console.log(`[${room.name || room.roomId}] ${joinedMemberCount}人 · ${event.getSender()}: ${prompt}`);
+      const commandInput = prompt.trimStart();
+      if (commandInput.startsWith("/")) {
+        const command = commandInput.split(/\s/u, 1)[0].toLowerCase();
+        let commandReply: string;
+        if (command === "/new") {
+          conversations.set(room.roomId, [{ role: "system", content: systemPrompt }]);
+          commandReply = "会話履歴をリセットしました。新しい会話を始めます。";
+        } else if (command === "/status") {
+          const messageCount = Math.max(0, (conversations.get(room.roomId)?.length ?? 1) - 1);
+          commandReply = `現在の会話履歴: ${messageCount}メッセージ（system promptを除く）。最大コンテキスト長はLLMサーバーから取得できません。`;
+        } else {
+          commandReply = `不明なコマンドです: ${command}\n利用可能なコマンド: /new, /status`;
+        }
+        await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: commandReply });
+        console.log(`  -> ${command}`);
+        return;
+      }
       let history = conversations.get(room.roomId);
       if (!history) { history = [{ role: "system", content: systemPrompt }]; conversations.set(room.roomId, history); }
       history.push({ role: "user", content: prompt });
