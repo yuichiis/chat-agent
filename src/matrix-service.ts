@@ -12,7 +12,7 @@ import type { ShowSasCallbacks } from "../node_modules/matrix-js-sdk/lib/crypto-
 import type { Logger } from "../node_modules/matrix-js-sdk/lib/logger.js";
 import { logger as matrixGlobalLogger } from "../node_modules/matrix-js-sdk/lib/logger.js";
 import { RelationType } from "../node_modules/matrix-js-sdk/lib/@types/event.js";
-import type { ChatMessage } from "./openai.js";
+import type { ChatMessage, ChatUsage } from "./openai.js";
 import { openAISettings, streamOpenAI } from "./openai.js";
 
 const homeserver = (process.env.MATRIX_HOMESERVER_URL ?? "https://matrix.org").replace(/\/+$/, "");
@@ -351,6 +351,7 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
   };
 
   const conversations = new Map<string, ChatMessage[]>();
+  const usageByRoom = new Map<string, ChatUsage>();
   const seen = new Set<string>();
   const decryptWarningAt = new Map<string, number>();
   const queues = new Map<string, Promise<void>>();
@@ -413,10 +414,15 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
         let commandReply: string;
         if (command === "/new") {
           conversations.set(room.roomId, [{ role: "system", content: systemPrompt }]);
+          usageByRoom.delete(room.roomId);
           commandReply = "会話履歴をリセットしました。新しい会話を始めます。";
         } else if (command === "/status") {
           const messageCount = Math.max(0, (conversations.get(room.roomId)?.length ?? 1) - 1);
-          commandReply = `現在の会話履歴: ${messageCount}メッセージ（system promptを除く）。最大コンテキスト長はLLMサーバーから取得できません。`;
+          const usage = usageByRoom.get(room.roomId);
+          const usageLine = usage
+            ? `直近のLLMリクエスト: prompt_tokens=${usage.prompt_tokens ?? "不明"}, completion_tokens=${usage.completion_tokens ?? "不明"}, total_tokens=${usage.total_tokens ?? "不明"}`
+            : "LLMトークン使用量: まだ取得できていません。";
+          commandReply = `${usageLine}\n会話履歴: ${messageCount}メッセージ（system promptを除く）\n最大コンテキスト長はLLM APIから取得できません。`;
         } else {
           commandReply = `不明なコマンドです: ${command}\n利用可能なコマンド: /new, /status`;
         }
@@ -448,7 +454,7 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
           await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: startupNotice }).catch((error: unknown) => {
             console.warn(`[${room.name || room.roomId}] 起動待ちメッセージを送信できません: ${error instanceof Error ? error.message : String(error)}`);
           });
-        });
+        }, (usage) => { usageByRoom.set(room.roomId, usage); });
         history.push({ role: "assistant", content: answer });
         await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: answer });
         console.log("  -> replied");
