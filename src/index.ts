@@ -1,6 +1,6 @@
 import readline from "node:readline/promises";
 import { stdin, stdout } from "node:process";
-import { openAISettings, streamOpenAI, type ChatMessage } from "./openai.js";
+import { loadSystemPrompt, openAISettings, streamOpenAI, type ChatMessage } from "./openai.js";
 import { runMatrixService } from "./matrix-service.js";
 
 const cyan = (s: string) => `\u001b[36m${s}\u001b[0m`;
@@ -9,7 +9,7 @@ const dim = (s: string) => `\u001b[2m${s}\u001b[0m`;
 async function runTui() {
   const rl = readline.createInterface({ input: stdin, output: stdout, terminal: true });
   const history: ChatMessage[] = [];
-  const systemPrompt = process.env.SYSTEM_PROMPT ?? "You are a helpful assistant.";
+  const systemPrompt = await loadSystemPrompt();
   stdout.write(`${cyan("OpenAI-compatible TUI Chat")} ${dim(`${openAISettings.baseUrl} · ${openAISettings.model}`)}\n`);
   stdout.write(`${dim("/clear 履歴消去 · /exit 終了") }\n\n`);
   while (true) {

@@ -47,6 +47,7 @@ The OAuth client registration ID is cached under `data/matrix-client.json`. Acce
 | `OPENAI_API_KEY` | unset | Optional Bearer token for the LLM server |
 | `OPENAI_STARTUP_WAIT_SECONDS` | `120` | Seconds to wait before retrying after `503 no upstreams available` |
 | `SYSTEM_PROMPT` | `You are a helpful assistant.` | LLM system message |
+| `SYSTEM_PROMPT_FILE` | unset | UTF-8 file containing the system prompt; used when `SYSTEM_PROMPT` is unset |
 | `MATRIX_HOMESERVER_URL` | `https://matrix.org` | Matrix homeserver URL |
 | `MATRIX_OAUTH_CLIENT_ID` | auto registered and cached | Optional pre-registered OAuth client ID |
 

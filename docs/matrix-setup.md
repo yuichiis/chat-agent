@@ -31,6 +31,14 @@ $env:OPENAI_STARTUP_WAIT_SECONDS = "120"
 $env:OPENAI_API_KEY = "your-api-key"
 ```
 
+システムプロンプトは、環境変数で直接指定するか、UTF-8ファイルから読み込めます。ファイル名はサービスを起動するカレントディレクトリからの相対パス、または絶対パスです。
+
+```powershell
+$env:SYSTEM_PROMPT_FILE = ".\system-prompt.txt"
+```
+
+優先順位は`SYSTEM_PROMPT`、`SYSTEM_PROMPT_FILE`、既定の`You are a helpful assistant.`です。`SYSTEM_PROMPT`が設定されている場合は、ファイル指定より優先します。この設定はMatrixサービスとTUIの両方で使われます。
+
 `OPENAI_BASE_URL` には `/v1` を含めません。クライアントは `/v1/chat/completions` を付けてアクセスします。環境変数は設定した PowerShell のプロセスにだけ適用されます。
 
 オンデマンド起動のLLMサーバーがHTTP 503と `no upstreams available` を返したときの再試行待ち時間は、`OPENAI_STARTUP_WAIT_SECONDS` で秒単位に設定できます。既定値は120秒です。0以上の整数を指定します。

@@ -13,10 +13,9 @@ import type { Logger } from "../node_modules/matrix-js-sdk/lib/logger.js";
 import { logger as matrixGlobalLogger } from "../node_modules/matrix-js-sdk/lib/logger.js";
 import { RelationType } from "../node_modules/matrix-js-sdk/lib/@types/event.js";
 import type { ChatMessage, ChatUsage } from "./openai.js";
-import { listOpenAIModels, openAISettings, setOpenAIModel, streamOpenAI } from "./openai.js";
+import { listOpenAIModels, loadSystemPrompt, openAISettings, setOpenAIModel, streamOpenAI } from "./openai.js";
 
 const homeserver = (process.env.MATRIX_HOMESERVER_URL ?? "https://matrix.org").replace(/\/+$/, "");
-const systemPrompt = process.env.SYSTEM_PROMPT ?? "You are a helpful assistant.";
 const dataDir = resolve(dirname(fileURLToPath(import.meta.url)), "../data");
 const clientInfoPath = resolve(dataDir, "matrix-client.json");
 const sessionPath = resolve(dataDir, "matrix-session.json");
@@ -298,6 +297,7 @@ async function login(sdkLogger: Logger) {
 export async function runMatrixService(options: { debug?: boolean } = {}): Promise<void> {
   const debug = options.debug ?? false;
   const serviceStartedAt = Date.now();
+  const systemPrompt = await loadSystemPrompt();
   filterSdkConsole(debug);
   (matrixGlobalLogger as unknown as { setLevel(level: string): void }).setLevel(debug ? "debug" : "warn");
   const sdkLogger = createSdkLogger(debug);

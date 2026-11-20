@@ -1,3 +1,5 @@
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import { stdout } from "node:process";
 
 export type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
@@ -6,12 +8,26 @@ const baseUrl = (process.env.OPENAI_BASE_URL ?? "http://127.0.0.1:9931").replace
 const endpoint = `${baseUrl}/v1/chat/completions`;
 let model = process.env.OPENAI_MODEL ?? "local-model";
 const apiKey = process.env.OPENAI_API_KEY;
+const defaultSystemPrompt = "You are a helpful assistant.";
 const configuredStartupWaitSeconds = Number(process.env.OPENAI_STARTUP_WAIT_SECONDS ?? 120);
 const startupWaitSeconds = Number.isInteger(configuredStartupWaitSeconds) && configuredStartupWaitSeconds >= 0
   ? configuredStartupWaitSeconds
   : 120;
 if (startupWaitSeconds !== configuredStartupWaitSeconds) {
   console.warn("OPENAI_STARTUP_WAIT_SECONDS は0以上の整数で指定してください。120秒を使います。");
+}
+
+export async function loadSystemPrompt(): Promise<string> {
+  if (process.env.SYSTEM_PROMPT !== undefined) return process.env.SYSTEM_PROMPT;
+  const promptFile = process.env.SYSTEM_PROMPT_FILE;
+  if (promptFile) {
+    try {
+      return await readFile(resolve(process.cwd(), promptFile), "utf8");
+    } catch (error) {
+      throw new Error(`SYSTEM_PROMPT_FILE を読み込めません (${promptFile}): ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return defaultSystemPrompt;
 }
 
 export async function listOpenAIModels(): Promise<string[]> {
