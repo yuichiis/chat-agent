@@ -13,7 +13,7 @@ import type { Logger } from "../node_modules/matrix-js-sdk/lib/logger.js";
 import { logger as matrixGlobalLogger } from "../node_modules/matrix-js-sdk/lib/logger.js";
 import { RelationType } from "../node_modules/matrix-js-sdk/lib/@types/event.js";
 import type { ChatMessage, ChatUsage } from "./openai.js";
-import { openAISettings, streamOpenAI } from "./openai.js";
+import { listOpenAIModels, openAISettings, setOpenAIModel, streamOpenAI } from "./openai.js";
 
 const homeserver = (process.env.MATRIX_HOMESERVER_URL ?? "https://matrix.org").replace(/\/+$/, "");
 const systemPrompt = process.env.SYSTEM_PROMPT ?? "You are a helpful assistant.";
@@ -305,7 +305,7 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
   console.log(`LLM: ${openAISettings.baseUrl} · ${openAISettings.model}`);
   console.log(`オンデマンド起動待ち: ${openAISettings.startupWaitSeconds}秒`);
   console.log("応答条件: 参加中メンバー2人以下は他の人の投稿、3人以上はエージェントへのメンション");
-  console.log("Matrixコマンド: /new（会話をリセット）, /status（会話履歴を表示）");
+  console.log("Matrixコマンド: /new, /status, /model [model-id]");
   console.log(debug ? "デバッグログ: 有効" : "デバッグログ: 無効（--debug で有効）");
   console.log("起動後のコマンド: /verify（この端末を認証）, /help。終了: Ctrl+C");
 
@@ -422,9 +422,26 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
           const usageLine = usage
             ? `直近のLLMリクエスト: prompt_tokens=${usage.prompt_tokens ?? "不明"}, completion_tokens=${usage.completion_tokens ?? "不明"}, total_tokens=${usage.total_tokens ?? "不明"}`
             : "LLMトークン使用量: まだ取得できていません。";
-          commandReply = `${usageLine}\n会話履歴: ${messageCount}メッセージ（system promptを除く）\n最大コンテキスト長はLLM APIから取得できません。`;
+          commandReply = `モデル: ${openAISettings.model}\n${usageLine}\n会話履歴: ${messageCount}メッセージ（system promptを除く）\n最大コンテキスト長はLLM APIから取得できません。`;
+        } else if (command === "/model") {
+          const argument = commandInput.slice(command.length).trim();
+          if (!argument) {
+            try {
+              const models = await listOpenAIModels();
+              commandReply = models.length
+                ? `利用可能なモデル:\n${models.map((id) => `${id}${id === openAISettings.model ? "（選択中）" : ""}`).join("\n")}`
+                : "Models APIからモデルが見つかりませんでした。";
+            } catch (error) {
+              commandReply = `モデル一覧を取得できませんでした: ${error instanceof Error ? error.message : String(error)}`;
+            }
+          } else if (/\s/u.test(argument)) {
+            commandReply = "使い方: /model または /model <model-id>";
+          } else {
+            setOpenAIModel(argument);
+            commandReply = `モデルを ${openAISettings.model} に切り替えました。`;
+          }
         } else {
-          commandReply = `不明なコマンドです: ${command}\n利用可能なコマンド: /new, /status`;
+          commandReply = `不明なコマンドです: ${command}\n利用可能なコマンド: /new, /status, /model`;
         }
         await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: commandReply });
         console.log(`  -> ${command}`);

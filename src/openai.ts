@@ -4,7 +4,7 @@ export type ChatMessage = { role: "system" | "user" | "assistant"; content: stri
 export type ChatUsage = { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
 const baseUrl = (process.env.OPENAI_BASE_URL ?? "http://127.0.0.1:9931").replace(/\/+$/, "");
 const endpoint = `${baseUrl}/v1/chat/completions`;
-const model = process.env.OPENAI_MODEL ?? "local-model";
+let model = process.env.OPENAI_MODEL ?? "local-model";
 const apiKey = process.env.OPENAI_API_KEY;
 const configuredStartupWaitSeconds = Number(process.env.OPENAI_STARTUP_WAIT_SECONDS ?? 120);
 const startupWaitSeconds = Number.isInteger(configuredStartupWaitSeconds) && configuredStartupWaitSeconds >= 0
@@ -12,6 +12,22 @@ const startupWaitSeconds = Number.isInteger(configuredStartupWaitSeconds) && con
   : 120;
 if (startupWaitSeconds !== configuredStartupWaitSeconds) {
   console.warn("OPENAI_STARTUP_WAIT_SECONDS は0以上の整数で指定してください。120秒を使います。");
+}
+
+export async function listOpenAIModels(): Promise<string[]> {
+  const headers: Record<string, string> = { accept: "application/json" };
+  if (apiKey) headers.authorization = `Bearer ${apiKey}`;
+  const response = await fetch(`${baseUrl}/v1/models`, { headers, signal: AbortSignal.timeout(30_000) });
+  if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+  const payload = await response.json() as { data?: Array<{ id?: unknown }> };
+  if (!Array.isArray(payload.data)) throw new Error("models APIの応答にdata配列がありません。");
+  return payload.data.flatMap((entry) => typeof entry.id === "string" ? [entry.id] : []);
+}
+
+export function setOpenAIModel(modelId: string): void {
+  const selected = modelId.trim();
+  if (!selected) throw new Error("モデルIDを指定してください。");
+  model = selected;
 }
 
 export async function streamOpenAI(
@@ -71,4 +87,4 @@ export async function streamOpenAI(
   return answer;
 }
 
-export const openAISettings = { baseUrl, model, startupWaitSeconds };
+export const openAISettings = { baseUrl, get model() { return model; }, startupWaitSeconds };

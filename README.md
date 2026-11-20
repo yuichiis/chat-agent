@@ -34,7 +34,7 @@ Invite the agent account shown at startup to a room, or start a direct chat with
 
 Messages sent before the current service process starts are ignored. Eligible new messages receive an `👀` reaction before processing; if the agent already reacted with `👀`, it skips that message.
 
-Matrix commands: `/new` clears that room's in-memory conversation history, and `/status` reports its message count. Unknown slash commands return a command help message.
+Matrix commands: `/new` clears that room's in-memory conversation history, `/status` reports the selected model and token usage, and `/model` lists available model IDs. Use `/model <model-id>` to switch models for this running service. Unknown slash commands return a command help message.
 
 The OAuth client registration ID is cached under `data/matrix-client.json`. Access and refresh tokens are stored in `data/matrix-session.json`, and the E2EE IndexedDB state is snapshotted to `data/matrix-crypto-<device-id>.bin`. These files are ignored by Git and created with owner-only permissions where supported. On restart, the service refreshes the saved token and restores the same encrypted device; if the refresh token is revoked or the crypto snapshot is missing, it starts device authorization again. Keep the `data` directory private and include it in backups if you need to preserve the Matrix device.
 
