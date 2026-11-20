@@ -48,9 +48,10 @@ export function setOpenAIModel(modelId: string): void {
 
 export async function streamOpenAI(
   messages: ChatMessage[],
-  onToken: (text: string) => void = (text) => stdout.write(text),
+  onToken: (text: string) => void | Promise<void> = (text) => { stdout.write(text); },
   onServerStarting: (waitSeconds: number) => void | Promise<void> = (waitSeconds) => { stdout.write(`\nLLMサーバーを起動しています。${waitSeconds}秒待って再試行します…\n`); },
   onUsage: (usage: ChatUsage) => void = () => undefined,
+  onReasoning: (text: string) => void | Promise<void> = () => undefined,
 ): Promise<string> {
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (apiKey) headers.authorization = `Bearer ${apiKey}`;
@@ -91,12 +92,16 @@ export async function streamOpenAI(
       if (data === "[DONE]") { finished = true; break; }
       if (!data) continue;
       const chunk = JSON.parse(data) as {
-        choices?: Array<{ delta?: { content?: string } }>;
+        choices?: Array<{ delta?: { content?: string; reasoning_content?: string } }>;
         usage?: ChatUsage | null;
       };
       if (chunk.usage) onUsage(chunk.usage);
-      const text = chunk.choices?.[0]?.delta?.content;
-      if (text) { answer += text; onToken(text); }
+      const delta = chunk.choices?.[0]?.delta;
+      if (delta?.reasoning_content) await onReasoning(delta.reasoning_content);
+      if (delta?.content) {
+        answer += delta.content;
+        await onToken(delta.content);
+      }
     }
     if (part.done) break;
   }

@@ -453,6 +453,56 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
       const typingTimeoutMs = 30_000;
       let typingStarted = false;
       let typingRefresh: NodeJS.Timeout | undefined;
+      let progressEventId: string | undefined;
+      let progressBody: string | undefined;
+      let progressTimer: NodeJS.Timeout | undefined;
+      let lastProgressUpdateAt = 0;
+      let progressQueue = Promise.resolve();
+      const writeProgress = async (body: string): Promise<void> => {
+        const write = async () => {
+          if (!progressEventId) {
+            const sent = await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body });
+            progressEventId = sent.event_id;
+          } else {
+            await client.sendMessage(room.roomId, {
+              msgtype: MsgType.Text,
+              body: `*${body}`,
+              "m.new_content": { msgtype: MsgType.Text, body },
+              "m.relates_to": { rel_type: RelationType.Replace, event_id: progressEventId },
+            });
+          }
+          lastProgressUpdateAt = Date.now();
+        };
+        progressQueue = progressQueue.catch(() => undefined).then(write);
+        await progressQueue;
+      };
+      const updateProgress = async (body: string, force = false): Promise<boolean> => {
+        progressBody = body;
+        const waitMs = 1_000 - (Date.now() - lastProgressUpdateAt);
+        if (progressEventId && !force && waitMs > 0) {
+          if (!progressTimer) {
+            progressTimer = setTimeout(() => {
+              progressTimer = undefined;
+              const pending = progressBody;
+              if (pending !== undefined) void updateProgress(pending, true);
+            }, waitMs);
+          }
+          return true;
+        }
+        if (progressTimer) clearTimeout(progressTimer);
+        progressTimer = undefined;
+        progressBody = undefined;
+        try {
+          await writeProgress(body);
+          return true;
+        } catch (error) {
+          console.warn(`[${room.name || room.roomId}] 進捗メッセージを更新できません: ${error instanceof Error ? error.message : String(error)}`);
+          return false;
+        }
+      };
+      let reasoningText = "";
+      let streamedAnswer = "";
+      let contentStarted = false;
       try {
         try {
           await client.sendTyping(room.roomId, true, typingTimeoutMs);
@@ -465,22 +515,45 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
         } catch (error) {
           console.warn(`[${room.name || room.roomId}] 入力中表示を開始できません: ${error instanceof Error ? error.message : String(error)}`);
         }
-        const answer = await streamOpenAI(history, () => undefined, async (waitSeconds) => {
+        const answer = await streamOpenAI(history, async (text) => {
+          streamedAnswer += text;
+          if (progressEventId) {
+            contentStarted = true;
+            await updateProgress(streamedAnswer.slice(-4_000));
+          }
+        }, async (waitSeconds) => {
           const startupNotice = `LLMサーバーを起動しています。約${waitSeconds}秒後に自動で再試行します。`;
           console.log(`[${room.name || room.roomId}] ${startupNotice}`);
           await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: startupNotice }).catch((error: unknown) => {
             console.warn(`[${room.name || room.roomId}] 起動待ちメッセージを送信できません: ${error instanceof Error ? error.message : String(error)}`);
           });
-        }, (usage) => { usageByRoom.set(room.roomId, usage); });
+        }, (usage) => { usageByRoom.set(room.roomId, usage); }, async (text) => {
+          reasoningText += text;
+          if (!progressEventId) await updateProgress("考え中...", true);
+          else if (!contentStarted) await updateProgress(`考え中...\n${reasoningText.slice(-3_000)}`);
+        });
+        if (!answer) throw new Error("LLMの応答に本文がありません。");
+        if (progressEventId) {
+          const updated = await updateProgress(answer, true);
+          if (!updated) await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: answer });
+        } else {
+          await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: answer });
+        }
         history.push({ role: "assistant", content: answer });
-        await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: answer });
         console.log("  -> replied");
       } catch (error) {
         history.pop();
         const message = error instanceof Error ? error.message : String(error);
         console.error(`LLM/Matrix reply failed: ${message}`);
-        await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: "すみません。LLM への接続中にエラーが発生しました。" }).catch(console.error);
+        const failureMessage = "すみません。LLM への接続中にエラーが発生しました。";
+        if (progressEventId) {
+          const updated = await updateProgress(failureMessage, true);
+          if (!updated) await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: failureMessage }).catch(console.error);
+        } else {
+          await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: failureMessage }).catch(console.error);
+        }
       } finally {
+        if (progressTimer) clearTimeout(progressTimer);
         if (typingRefresh) clearInterval(typingRefresh);
         if (typingStarted) {
           await client.sendTyping(room.roomId, false, typingTimeoutMs).catch((error: unknown) => {
