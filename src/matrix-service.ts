@@ -588,6 +588,10 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
           if (!progressEventId) await updateProgress("考え中...", true);
           else if (!contentStarted) void updateProgress(`考え中...\n${reasoningText.slice(-3_000)}`, false, false);
         }, mcpTools, callMcpTool, async (toolEvent) => {
+          if (toolEvent.phase !== "start") {
+            contentStarted = false;
+            reasoningText = "";
+          }
           if (toolEvent.phase === "error") {
             const detail = toolEvent.detail || "詳細不明";
             const notice = `MCPツール ${toolEvent.name} でエラーが発生しました:\n${detail.slice(0, 2_000)}\n考え中...`;

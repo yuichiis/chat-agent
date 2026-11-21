@@ -18,6 +18,13 @@ const startupWaitSeconds = Number.isInteger(configuredStartupWaitSeconds) && con
 if (startupWaitSeconds !== configuredStartupWaitSeconds) {
   console.warn("OPENAI_STARTUP_WAIT_SECONDS は0以上の整数で指定してください。120秒を使います。");
 }
+const configuredMaxToolRounds = Number(process.env.MCP_MAX_TOOL_ROUNDS ?? 8);
+const maxToolRounds = Number.isInteger(configuredMaxToolRounds) && configuredMaxToolRounds >= 1
+  ? configuredMaxToolRounds
+  : 8;
+if (maxToolRounds !== configuredMaxToolRounds) {
+  console.warn("MCP_MAX_TOOL_ROUNDS は1以上の整数で指定してください。8回を使います。");
+}
 
 export async function loadSystemPrompt(): Promise<string> {
   if (process.env.SYSTEM_PROMPT !== undefined) return process.env.SYSTEM_PROMPT;
@@ -185,7 +192,11 @@ export async function streamOpenAI(
   }
   if (calls.size) {
     if (signal?.aborted) throw new Error("LLM生成を中止しました (/stop)。");
-    if (!tools.length || retries++ >= 8) throw new Error("MCP tool-callの上限に達したか、ツールが未設定です。");
+    if (!tools.length) throw new Error("LLMがtool_callを返しましたが、利用可能なMCPツールがありません。");
+    if (retries >= maxToolRounds) {
+      throw new Error(`MCP tool-callの最大反復回数(${maxToolRounds}回)に達しました。MCP_MAX_TOOL_ROUNDSで変更できます。`);
+    }
+    retries++;
     const toolCalls = [...calls.entries()].sort(([a], [b]) => a - b).map(([, call]) => ({
       id: call.id, type: "function" as const, function: { name: call.name, arguments: call.arguments },
     }));

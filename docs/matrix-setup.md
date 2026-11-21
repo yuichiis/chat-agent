@@ -23,6 +23,7 @@ npm.cmd install
 $env:OPENAI_BASE_URL = "http://127.0.0.1:9931"
 $env:OPENAI_MODEL = "local-model"
 $env:OPENAI_STARTUP_WAIT_SECONDS = "120"
+$env:MCP_MAX_TOOL_ROUNDS = "8"
 ```
 
 認証が必要な OpenAI 互換サーバーでは、API キーを設定します。
@@ -42,6 +43,8 @@ $env:SYSTEM_PROMPT_FILE = ".\system-prompt.txt"
 `OPENAI_BASE_URL` には `/v1` を含めません。クライアントは `/v1/chat/completions` を付けてアクセスします。環境変数は設定した PowerShell のプロセスにだけ適用されます。
 
 オンデマンド起動のLLMサーバーがHTTP 503と `no upstreams available` を返したときの再試行待ち時間は、`OPENAI_STARTUP_WAIT_SECONDS` で秒単位に設定できます。既定値は120秒です。0以上の整数を指定します。
+
+1回のユーザーメッセージに対してLLMが連続してMCPツールを呼び出せる上限は、`MCP_MAX_TOOL_ROUNDS`で設定します。既定値は8回で、1以上の整数を指定します。反復中に無限ループが起きた場合は、Matrixルームへ`/stop`を送ると生成を中止できます。
 
 ## 3. エージェント用アカウントを用意する
 
@@ -91,7 +94,7 @@ npm.cmd run service -- --debug
 
 LLMの応答生成中はElementに入力中表示を送り、長時間の生成では通知を定期更新します。返信またはエラーを送った後に入力中表示を解除します。
 
-LLM応答で`reasoning_content`が先に届いた場合、ルームに「考え中...」を表示し、同じMatrixメッセージを編集して進捗を更新します。通常の`content`が届き始めると、そのメッセージを応答本文に置き換えて確定します。
+LLM応答で`reasoning_content`が先に届いた場合、ルームに「考え中...」を表示し、同じMatrixメッセージを編集して進捗を更新します。MCPツール実行後の生成でもreasoningを同じメッセージに表示します。通常の`content`が届き始めると、そのメッセージを応答本文に置き換えて確定します。
 
 オンデマンド起動のLLMサーバーがHTTP 503と `no upstreams available` を返した場合、ルームに起動中の案内を送り、`OPENAI_STARTUP_WAIT_SECONDS` の秒数（既定120秒）待って同じリクエストを1回再試行します。再試行も失敗した場合は通常のエラー応答になります。
 
@@ -99,12 +102,13 @@ LLM応答で`reasoning_content`が先に届いた場合、ルームに「考え�
 
 ### Matrixルーム内コマンド
 
-コマンドは通常の応答条件に従います。2人以下のルームではエージェント以外から送信し、3人以上のルームではエージェントにメンションしてください。
+`/stop`以外のコマンドは通常の応答条件に従います。2人以下のルームではエージェント以外から送信し、3人以上のルームではエージェントにメンションしてください。
 
 - `/new`: そのルームの会話履歴を消去して、新しい会話を始めます。
 - `/status`: 選択中のモデル、直近LLMレスポンスの`prompt_tokens`・`completion_tokens`・`total_tokens`、会話履歴数を表示します。
 - `/model`: OpenAI互換の`/v1/models` APIからモデルID一覧を取得します。選択中のIDには印が付きます。
 - `/model <model-id>`: このサービス実行中に使うモデルを切り替えます。再起動すると`OPENAI_MODEL`の設定に戻ります。
+- `/stop`: そのルームで実行中のLLM生成またはMCPツール呼び出しを中止します。3人以上のルームでもメンションは不要です。
 - 未知の`/`コマンド: 不明なコマンドであることと、利用可能なコマンドを返信します。
 
 最大コンテキスト長はLLM APIから取得できません。usageが返らない場合、`/status`はトークン数未取得と会話履歴数を表示します。
