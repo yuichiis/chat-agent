@@ -538,15 +538,18 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
         }, mcpTools, callMcpTool, async (toolEvent) => {
           if (toolEvent.phase === "error") {
             const detail = toolEvent.detail || "詳細不明";
-            const notice = `MCPツール ${toolEvent.name} でエラーが発生しました:\n${detail.slice(0, 2_000)}`;
+            const notice = `MCPツール ${toolEvent.name} でエラーが発生しました:\n${detail.slice(0, 2_000)}\n考え中...`;
             console.error(`[${room.name || room.roomId}] ${notice}`);
-            await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: notice }).catch((sendError: unknown) => {
-              console.error(`[${room.name || room.roomId}] MCPエラーの通知に失敗しました: ${sendError instanceof Error ? sendError.message : String(sendError)}`);
-            });
+            await updateProgress(notice, true);
           } else if (toolEvent.phase === "start") {
-            console.log(`[${room.name || room.roomId}] MCP tool: ${toolEvent.name} ${JSON.stringify(toolEvent.args)}`);
+            const args = JSON.stringify(toolEvent.args);
+            const notice = `MCPツール実行中: ${toolEvent.name}\n引数: ${args.slice(0, 1_000)}`;
+            console.log(`[${room.name || room.roomId}] ${notice}`);
+            await updateProgress(notice, true);
           } else {
-            console.log(`[${room.name || room.roomId}] MCP tool completed: ${toolEvent.name}`);
+            const notice = `MCPツール完了: ${toolEvent.name}`;
+            console.log(`[${room.name || room.roomId}] ${notice}`);
+            await updateProgress(`${notice}\n考え中...`, true);
           }
         });
         if (!answer) throw new Error("LLMの応答に本文がありません。");
