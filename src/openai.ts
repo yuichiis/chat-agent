@@ -5,6 +5,7 @@ import type { OpenAITool } from "./mcp.js";
 
 export type ChatMessage = { role: "system" | "user" | "assistant" | "tool"; content: string; tool_call_id?: string; tool_calls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> };
 export type ChatUsage = { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+export type ToolCallEvent = { phase: "start" | "result" | "error"; name: string; args: unknown; detail?: string };
 const baseUrl = (process.env.OPENAI_BASE_URL ?? "http://127.0.0.1:9931").replace(/\/+$/, "");
 const endpoint = `${baseUrl}/v1/chat/completions`;
 let model = process.env.OPENAI_MODEL ?? "local-model";
@@ -55,6 +56,7 @@ export async function streamOpenAI(
   onReasoning: (text: string) => void | Promise<void> = () => undefined,
   tools: OpenAITool[] = [],
   executeTool: (name: string, args: unknown) => Promise<unknown> = async () => { throw new Error("MCP tool executor is not configured."); },
+  onToolCall: (event: ToolCallEvent) => void | Promise<void> = () => undefined,
 ): Promise<string> {
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (apiKey) headers.authorization = `Bearer ${apiKey}`;
@@ -125,9 +127,30 @@ export async function streamOpenAI(
     }));
     messages.push({ role: "assistant", content: answer, tool_calls: toolCalls });
     for (const call of toolCalls) {
+      let args: unknown;
+      try { args = JSON.parse(call.function.arguments || "{}"); }
+      catch (error) {
+        const detail = `ツール引数のJSONを解析できません (${call.function.name}): ${error instanceof Error ? error.message : String(error)}`;
+        await onToolCall({ phase: "error", name: call.function.name, args: call.function.arguments, detail });
+        messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify({ error: detail }) });
+        continue;
+      }
+      await onToolCall({ phase: "start", name: call.function.name, args });
       let result: unknown;
-      try { result = await executeTool(call.function.name, JSON.parse(call.function.arguments || "{}")); }
-      catch (error) { result = { error: error instanceof Error ? error.message : String(error) }; }
+      try {
+        result = await executeTool(call.function.name, args);
+        const resultRecord = result && typeof result === "object" ? result as { isError?: unknown; content?: unknown } : undefined;
+        if (resultRecord?.isError === true) {
+          const detail = JSON.stringify(resultRecord.content ?? result);
+          await onToolCall({ phase: "error", name: call.function.name, args, detail });
+        } else {
+          await onToolCall({ phase: "result", name: call.function.name, args, detail: JSON.stringify(result) });
+        }
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        result = { error: detail };
+        await onToolCall({ phase: "error", name: call.function.name, args, detail });
+      }
       messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
     }
     continue;

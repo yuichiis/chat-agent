@@ -535,7 +535,20 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
           reasoningText += text;
           if (!progressEventId) await updateProgress("考え中...", true);
           else if (!contentStarted) await updateProgress(`考え中...\n${reasoningText.slice(-3_000)}`);
-        }, mcpTools, callMcpTool);
+        }, mcpTools, callMcpTool, async (toolEvent) => {
+          if (toolEvent.phase === "error") {
+            const detail = toolEvent.detail || "詳細不明";
+            const notice = `MCPツール ${toolEvent.name} でエラーが発生しました:\n${detail.slice(0, 2_000)}`;
+            console.error(`[${room.name || room.roomId}] ${notice}`);
+            await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: notice }).catch((sendError: unknown) => {
+              console.error(`[${room.name || room.roomId}] MCPエラーの通知に失敗しました: ${sendError instanceof Error ? sendError.message : String(sendError)}`);
+            });
+          } else if (toolEvent.phase === "start") {
+            console.log(`[${room.name || room.roomId}] MCP tool: ${toolEvent.name} ${JSON.stringify(toolEvent.args)}`);
+          } else {
+            console.log(`[${room.name || room.roomId}] MCP tool completed: ${toolEvent.name}`);
+          }
+        });
         if (!answer) throw new Error("LLMの応答に本文がありません。");
         if (progressEventId) {
           const updated = await updateProgress(answer, true);
@@ -549,7 +562,7 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
         history.pop();
         const message = error instanceof Error ? error.message : String(error);
         console.error(`LLM/Matrix reply failed: ${message}`);
-        const failureMessage = "すみません。LLM への接続中にエラーが発生しました。";
+        const failureMessage = `処理中にエラーが発生しました。\n${message.slice(0, 2_000)}`;
         if (progressEventId) {
           const updated = await updateProgress(failureMessage, true);
           if (!updated) await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: failureMessage }).catch(console.error);

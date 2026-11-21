@@ -25,7 +25,23 @@ async function runTui() {
     if (input.startsWith("/")) { stdout.write(dim("コマンド: /clear, /exit\n")); continue; }
     history.push({ role: "user", content: input });
     stdout.write(cyan("assistant › "));
-    try { history.push({ role: "assistant", content: await streamOpenAI(history, undefined, undefined, undefined, undefined, mcpTools, callMcpTool) }); }
+    let reasoningLabelShown = false;
+    try { history.push({ role: "assistant", content: await streamOpenAI(
+      history,
+      (text) => { stdout.write(text); },
+      undefined,
+      undefined,
+      (text) => {
+        if (!reasoningLabelShown) { stdout.write(`\n${dim("[reasoning] ")}`); reasoningLabelShown = true; }
+        stdout.write(text);
+      },
+      mcpTools,
+      callMcpTool,
+      (event) => {
+        const label = event.phase === "start" ? "実行中" : event.phase === "result" ? "結果" : "エラー";
+        stdout.write(`\n${dim(`[tool ${label}] ${event.name}${event.detail ? `: ${event.detail}` : ` ${JSON.stringify(event.args)}`}`)}\n`);
+      },
+    ) }); }
     catch (error) {
       history.pop();
       stdout.write(`\u001b[31m接続エラー: ${error instanceof Error ? error.message : String(error)}\u001b[0m\n`);
