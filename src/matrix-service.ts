@@ -309,7 +309,7 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
   console.log(`LLM: ${openAISettings.baseUrl} · ${openAISettings.model}`);
   console.log(`オンデマンド起動待ち: ${openAISettings.startupWaitSeconds}秒`);
   console.log("応答条件: 参加中メンバー2人以下は他の人の投稿、3人以上はエージェントへのメンション");
-  console.log("Matrixコマンド: /new, /status, /model [model-id]");
+  console.log("Matrixコマンド: /new, /status, /model [model-id], /stop");
   console.log(debug ? "デバッグログ: 有効" : "デバッグログ: 無効（--debug で有効）");
   console.log("起動後のコマンド: /verify（この端末を認証）, /help。終了: Ctrl+C");
 
@@ -359,6 +359,7 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
   const seen = new Set<string>();
   const decryptWarningAt = new Map<string, number>();
   const queues = new Map<string, Promise<void>>();
+  const activeRequests = new Map<string, AbortController>();
   const hasOwnEyesReaction = async (roomId: string, eventId: string): Promise<boolean> => {
     let from: string | undefined;
     do {
@@ -384,18 +385,35 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
       "m.mentions"?: { user_ids?: string[] };
     }>();
     if (content.msgtype !== "m.text" || !content.body || !room) return;
+    const prompt = content.body.trim();
+    if (!prompt) return;
+    const isStopCommand = prompt.split(/\s/u, 1)[0].toLowerCase() === "/stop";
     const joinedMemberCount = room.getJoinedMemberCount();
     const mentionedViaMetadata = content["m.mentions"]?.user_ids?.includes(session.userId) ?? false;
     const mentionedInBody = containsUserIdMention(content.body, session.userId)
       || content.formatted_body?.includes(`matrix.to/#/${session.userId}`)
       || content.formatted_body?.includes(`matrix.to/#/${encodeURIComponent(session.userId)}`)
       || false;
-    if (joinedMemberCount > 2 && !mentionedViaMetadata && !mentionedInBody) return;
+    if (joinedMemberCount > 2 && !mentionedViaMetadata && !mentionedInBody && !isStopCommand) return;
     const eventId = event.getId();
     if (eventId && seen.has(eventId)) return;
     if (eventId) seen.add(eventId);
-    const prompt = content.body.trim();
-    if (!prompt) return;
+    if (isStopCommand) {
+      const activeRequest = activeRequests.get(room.roomId);
+      activeRequest?.abort();
+      void (async () => {
+        if (eventId && !(await hasOwnEyesReaction(room.roomId, eventId))) {
+          await client.sendEvent(room.roomId, EventType.Reaction, {
+            "m.relates_to": { rel_type: RelationType.Annotation, event_id: eventId, key: "👀" },
+          });
+        }
+        const notice = activeRequest ? "LLMの生成を中止しています…" : "このルームで実行中のLLM生成はありません。";
+        await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: notice });
+      })().catch((error: unknown) => {
+        console.error(`[${room.name || room.roomId}] /stopの処理に失敗しました: ${error instanceof Error ? error.message : String(error)}`);
+      });
+      return;
+    }
 
     const prior = queues.get(room.roomId) ?? Promise.resolve();
     const task = prior.then(async () => {
@@ -431,7 +449,13 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
           const argument = commandInput.slice(command.length).trim();
           if (!argument) {
             try {
-              const models = await listOpenAIModels();
+              const models = await listOpenAIModels(async (waitSeconds) => {
+                const notice = `LLMサーバーを起動しています。約${waitSeconds}秒後にModels APIを再試行します。`;
+                console.log(`[${room.name || room.roomId}] ${notice}`);
+                await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: notice }).catch((error: unknown) => {
+                  console.warn(`[${room.name || room.roomId}] 起動待ちメッセージを送信できません: ${error instanceof Error ? error.message : String(error)}`);
+                });
+              });
               commandReply = models.length
                 ? `利用可能なモデル:\n${models.map((id) => `${id}${id === openAISettings.model ? "（選択中）" : ""}`).join("\n")}`
                 : "Models APIからモデルが見つかりませんでした。";
@@ -445,7 +469,7 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
             commandReply = `モデルを ${openAISettings.model} に切り替えました。`;
           }
         } else {
-          commandReply = `不明なコマンドです: ${command}\n利用可能なコマンド: /new, /status, /model`;
+          commandReply = `不明なコマンドです: ${command}\n利用可能なコマンド: /new, /status, /model, /stop`;
         }
         await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: commandReply });
         console.log(`  -> ${command}`);
@@ -453,7 +477,10 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
       }
       let history = conversations.get(room.roomId);
       if (!history) { history = [{ role: "system", content: systemPrompt }]; conversations.set(room.roomId, history); }
+      const historyStartLength = history.length;
       history.push({ role: "user", content: prompt });
+      const abortController = new AbortController();
+      activeRequests.set(room.roomId, abortController);
       const typingTimeoutMs = 30_000;
       let typingStarted = false;
       let typingRefresh: NodeJS.Timeout | undefined;
@@ -461,48 +488,73 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
       let progressBody: string | undefined;
       let progressTimer: NodeJS.Timeout | undefined;
       let lastProgressUpdateAt = 0;
-      let progressQueue = Promise.resolve();
+      let progressInFlight = false;
+      let pendingProgressForce = false;
+      let progressRevision = 0;
+      let progressWaiters: Array<{ revision: number; resolve: (success: boolean) => void }> = [];
       const writeProgress = async (body: string): Promise<void> => {
-        const write = async () => {
-          if (!progressEventId) {
-            const sent = await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body });
-            progressEventId = sent.event_id;
-          } else {
-            await client.sendMessage(room.roomId, {
-              msgtype: MsgType.Text,
-              body: `*${body}`,
-              "m.new_content": { msgtype: MsgType.Text, body },
-              "m.relates_to": { rel_type: RelationType.Replace, event_id: progressEventId },
-            });
-          }
-          lastProgressUpdateAt = Date.now();
-        };
-        progressQueue = progressQueue.catch(() => undefined).then(write);
-        await progressQueue;
+        if (!progressEventId) {
+          const sent = await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body });
+          progressEventId = sent.event_id;
+        } else {
+          await client.sendMessage(room.roomId, {
+            msgtype: MsgType.Text,
+            body: `*${body}`,
+            "m.new_content": { msgtype: MsgType.Text, body },
+            "m.relates_to": { rel_type: RelationType.Replace, event_id: progressEventId },
+          });
+        }
       };
-      const updateProgress = async (body: string, force = false): Promise<boolean> => {
-        progressBody = body;
+      const settleProgressWaiters = (throughRevision: number, success: boolean) => {
+        const remaining = [] as typeof progressWaiters;
+        for (const waiter of progressWaiters) {
+          if (waiter.revision <= throughRevision) waiter.resolve(success);
+          else remaining.push(waiter);
+        }
+        progressWaiters = remaining;
+      };
+      const drainProgress = async (): Promise<void> => {
+        if (progressInFlight || progressBody === undefined) return;
         const waitMs = 1_000 - (Date.now() - lastProgressUpdateAt);
-        if (progressEventId && !force && waitMs > 0) {
+        if (!pendingProgressForce && progressEventId && waitMs > 0) {
           if (!progressTimer) {
             progressTimer = setTimeout(() => {
               progressTimer = undefined;
-              const pending = progressBody;
-              if (pending !== undefined) void updateProgress(pending, true);
+              void drainProgress();
             }, waitMs);
           }
-          return true;
+          return;
         }
         if (progressTimer) clearTimeout(progressTimer);
         progressTimer = undefined;
+        const body = progressBody;
+        const revision = progressRevision;
         progressBody = undefined;
-        try {
-          await writeProgress(body);
-          return true;
-        } catch (error) {
+        pendingProgressForce = false;
+        progressInFlight = true;
+        lastProgressUpdateAt = Date.now();
+        let success = true;
+        try { await writeProgress(body); }
+        catch (error) {
+          success = false;
           console.warn(`[${room.name || room.roomId}] 進捗メッセージを更新できません: ${error instanceof Error ? error.message : String(error)}`);
-          return false;
+        } finally {
+          progressInFlight = false;
+          settleProgressWaiters(revision, success);
         }
+        if (progressBody !== undefined) void drainProgress();
+      };
+      const updateProgress = async (body: string, force = false, waitForDelivery = true): Promise<boolean> => {
+        progressBody = body;
+        const revision = ++progressRevision;
+        pendingProgressForce ||= force;
+        if (!waitForDelivery) {
+          void drainProgress();
+          return true;
+        }
+        const result = new Promise<boolean>((resolveResult) => progressWaiters.push({ revision, resolve: resolveResult }));
+        void drainProgress();
+        return result;
       };
       let reasoningText = "";
       let streamedAnswer = "";
@@ -523,7 +575,7 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
           streamedAnswer += text;
           if (progressEventId) {
             contentStarted = true;
-            await updateProgress(streamedAnswer.slice(-4_000));
+            void updateProgress(streamedAnswer.slice(-4_000), false, false);
           }
         }, async (waitSeconds) => {
           const startupNotice = `LLMサーバーを起動しています。約${waitSeconds}秒後に自動で再試行します。`;
@@ -534,7 +586,7 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
         }, (usage) => { usageByRoom.set(room.roomId, usage); }, async (text) => {
           reasoningText += text;
           if (!progressEventId) await updateProgress("考え中...", true);
-          else if (!contentStarted) await updateProgress(`考え中...\n${reasoningText.slice(-3_000)}`);
+          else if (!contentStarted) void updateProgress(`考え中...\n${reasoningText.slice(-3_000)}`, false, false);
         }, mcpTools, callMcpTool, async (toolEvent) => {
           if (toolEvent.phase === "error") {
             const detail = toolEvent.detail || "詳細不明";
@@ -551,7 +603,7 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
             console.log(`[${room.name || room.roomId}] ${notice}`);
             await updateProgress(`${notice}\n考え中...`, true);
           }
-        });
+        }, abortController.signal);
         if (!answer) throw new Error("LLMの応答に本文がありません。");
         if (progressEventId) {
           const updated = await updateProgress(answer, true);
@@ -562,17 +614,24 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
         history.push({ role: "assistant", content: answer });
         console.log("  -> replied");
       } catch (error) {
-        history.pop();
         const message = error instanceof Error ? error.message : String(error);
-        console.error(`LLM/Matrix reply failed: ${message}`);
-        const failureMessage = `処理中にエラーが発生しました。\n${message.slice(0, 2_000)}`;
-        if (progressEventId) {
-          const updated = await updateProgress(failureMessage, true);
-          if (!updated) await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: failureMessage }).catch(console.error);
+        if (abortController.signal.aborted) {
+          history.splice(historyStartLength);
+          console.log(`[${room.name || room.roomId}] LLM生成を/stopで中止しました。`);
+          if (progressEventId) await updateProgress("生成を中止しました。", true);
         } else {
-          await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: failureMessage }).catch(console.error);
+          history.pop();
+          console.error(`LLM/Matrix reply failed: ${message}`);
+          const failureMessage = `処理中にエラーが発生しました。\n${message.slice(0, 2_000)}`;
+          if (progressEventId) {
+            const updated = await updateProgress(failureMessage, true);
+            if (!updated) await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: failureMessage }).catch(console.error);
+          } else {
+            await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: failureMessage }).catch(console.error);
+          }
         }
       } finally {
+        if (activeRequests.get(room.roomId) === abortController) activeRequests.delete(room.roomId);
         if (progressTimer) clearTimeout(progressTimer);
         if (typingRefresh) clearInterval(typingRefresh);
         if (typingStarted) {

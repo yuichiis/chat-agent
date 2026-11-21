@@ -32,10 +32,28 @@ export async function loadSystemPrompt(): Promise<string> {
   return defaultSystemPrompt;
 }
 
-export async function listOpenAIModels(): Promise<string[]> {
+export async function listOpenAIModels(
+  onServerStarting: (waitSeconds: number) => void | Promise<void> = (waitSeconds) => {
+    stdout.write(`\nLLMサーバーを起動しています。${waitSeconds}秒待って再試行します…\n`);
+  },
+): Promise<string[]> {
   const headers: Record<string, string> = { accept: "application/json" };
   if (apiKey) headers.authorization = `Bearer ${apiKey}`;
-  const response = await fetch(`${baseUrl}/v1/models`, { headers, signal: AbortSignal.timeout(30_000) });
+  const request = () => fetch(`${baseUrl}/v1/models`, { headers, signal: AbortSignal.timeout(30_000) });
+  let response = await request();
+  if (response.status === 503) {
+    const errorBody = await response.text();
+    let noUpstreamsAvailable = false;
+    try { noUpstreamsAvailable = (JSON.parse(errorBody) as { error?: unknown }).error === "no upstreams available"; }
+    catch { /* return the original server error below */ }
+    if (noUpstreamsAvailable) {
+      await onServerStarting(startupWaitSeconds);
+      await new Promise((resolveWait) => setTimeout(resolveWait, startupWaitSeconds * 1000));
+      response = await request();
+    } else {
+      throw new Error(`HTTP 503: ${errorBody}`);
+    }
+  }
   if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
   const payload = await response.json() as { data?: Array<{ id?: unknown }> };
   if (!Array.isArray(payload.data)) throw new Error("models APIの応答にdata配列がありません。");
@@ -55,16 +73,32 @@ export async function streamOpenAI(
   onUsage: (usage: ChatUsage) => void = () => undefined,
   onReasoning: (text: string) => void | Promise<void> = () => undefined,
   tools: OpenAITool[] = [],
-  executeTool: (name: string, args: unknown) => Promise<unknown> = async () => { throw new Error("MCP tool executor is not configured."); },
+  executeTool: (name: string, args: unknown, signal?: AbortSignal) => Promise<unknown> = async () => { throw new Error("MCP tool executor is not configured."); },
   onToolCall: (event: ToolCallEvent) => void | Promise<void> = () => undefined,
+  signal?: AbortSignal,
 ): Promise<string> {
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (apiKey) headers.authorization = `Bearer ${apiKey}`;
-  const request = () => fetch(endpoint, {
-    method: "POST", headers,
-    body: JSON.stringify({ model, messages, stream: true, stream_options: { include_usage: true }, ...(tools.length ? { tools, tool_choice: "auto" } : {}) }),
-    signal: AbortSignal.timeout(600_000),
-  });
+  let activeController = new AbortController();
+  const request = async () => {
+    if (signal?.aborted) throw new Error("LLM生成を中止しました (/stop)。");
+    activeController = new AbortController();
+    const controller = activeController;
+    const headerTimer = setTimeout(() => controller.abort(), 600_000);
+    try {
+      return await fetch(endpoint, {
+        method: "POST", headers,
+        body: JSON.stringify({ model, messages, stream: true, stream_options: { include_usage: true }, ...(tools.length ? { tools, tool_choice: "auto" } : {}) }),
+        signal: signal ? AbortSignal.any([controller.signal, signal]) : controller.signal,
+      });
+    } catch (error) {
+      if (signal?.aborted) throw new Error("LLM生成を中止しました (/stop)。");
+      if (controller.signal.aborted) throw new Error("LLM APIから10分以内に応答ヘッダーを受信できませんでした。");
+      throw error;
+    } finally {
+      clearTimeout(headerTimer);
+    }
+  };
   let retries = 0;
   while (true) {
   let response = await request();
@@ -77,7 +111,19 @@ export async function streamOpenAI(
     } catch { /* keep the server's original error below */ }
     if (noUpstreamsAvailable) {
       await onServerStarting(startupWaitSeconds);
-      await new Promise((resolveWait) => setTimeout(resolveWait, startupWaitSeconds * 1000));
+      if (signal?.aborted) throw new Error("LLM生成を中止しました (/stop)。");
+      await new Promise<void>((resolveWait, rejectWait) => {
+        const timer = setTimeout(() => {
+          signal?.removeEventListener("abort", onAbort);
+          resolveWait();
+        }, startupWaitSeconds * 1000);
+        const onAbort = () => {
+          clearTimeout(timer);
+          rejectWait(new Error("LLM生成を中止しました (/stop)。"));
+        };
+        signal?.addEventListener("abort", onAbort, { once: true });
+        if (signal?.aborted) onAbort();
+      });
       response = await request();
     } else {
       throw new Error(`OpenAI API HTTP 503: ${errorBody}`);
@@ -90,7 +136,24 @@ export async function streamOpenAI(
   let pending = "", answer = "", finished = false;
   const calls = new Map<number, { id: string; name: string; arguments: string }>();
   while (!finished) {
-    const part = await reader.read();
+    let idleTimer: NodeJS.Timeout | undefined;
+    let part: ReadableStreamReadResult<Uint8Array>;
+    try {
+      part = await Promise.race([
+        reader.read(),
+        new Promise<never>((_, reject) => {
+          idleTimer = setTimeout(() => {
+            activeController.abort();
+            reject(new Error("LLMストリームから10分間データを受信できませんでした。"));
+          }, 600_000);
+        }),
+      ]);
+    } catch (error) {
+      if (signal?.aborted) throw new Error("LLM生成を中止しました (/stop)。");
+      throw error;
+    } finally {
+      if (idleTimer) clearTimeout(idleTimer);
+    }
     pending += decoder.decode(part.value, { stream: !part.done });
     const lines = pending.split(/\r?\n/);
     pending = lines.pop() ?? "";
@@ -121,6 +184,7 @@ export async function streamOpenAI(
     if (part.done) break;
   }
   if (calls.size) {
+    if (signal?.aborted) throw new Error("LLM生成を中止しました (/stop)。");
     if (!tools.length || retries++ >= 8) throw new Error("MCP tool-callの上限に達したか、ツールが未設定です。");
     const toolCalls = [...calls.entries()].sort(([a], [b]) => a - b).map(([, call]) => ({
       id: call.id, type: "function" as const, function: { name: call.name, arguments: call.arguments },
@@ -136,9 +200,10 @@ export async function streamOpenAI(
         continue;
       }
       await onToolCall({ phase: "start", name: call.function.name, args });
+      if (signal?.aborted) throw new Error("LLM生成を中止しました (/stop)。");
       let result: unknown;
       try {
-        result = await executeTool(call.function.name, args);
+        result = await executeTool(call.function.name, args, signal);
         const resultRecord = result && typeof result === "object" ? result as { isError?: unknown; content?: unknown } : undefined;
         if (resultRecord?.isError === true) {
           const detail = JSON.stringify(resultRecord.content ?? result);
@@ -147,6 +212,7 @@ export async function streamOpenAI(
           await onToolCall({ phase: "result", name: call.function.name, args, detail: JSON.stringify(result) });
         }
       } catch (error) {
+        if (signal?.aborted) throw new Error("LLM生成を中止しました (/stop)。");
         const detail = error instanceof Error ? error.message : String(error);
         result = { error: detail };
         await onToolCall({ phase: "error", name: call.function.name, args, detail });

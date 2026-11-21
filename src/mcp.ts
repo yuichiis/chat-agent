@@ -36,12 +36,16 @@ export async function startMcpServers(configPath = resolve(process.cwd(), "confi
   })));
 }
 
-export async function callMcpTool(name: string, args: unknown): Promise<unknown> {
+export async function callMcpTool(name: string, args: unknown, signal?: AbortSignal): Promise<unknown> {
   const route = toolRoutes.get(name);
   if (!route) throw new Error(`未登録のMCPツールです: ${name}`);
   const entry = clients.get(route.server);
   if (!entry) throw new Error(`MCPサーバーに接続されていません: ${route.server}`);
-  return entry.client.callTool({ name: route.name, arguments: (args ?? {}) as Record<string, unknown> });
+  return entry.client.callTool(
+    { name: route.name, arguments: (args ?? {}) as Record<string, unknown> },
+    undefined,
+    signal ? { signal } : undefined,
+  );
 }
 
 export async function stopMcpServers(): Promise<void> {
