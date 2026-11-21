@@ -1,8 +1,9 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { stdout } from "node:process";
+import type { OpenAITool } from "./mcp.js";
 
-export type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
+export type ChatMessage = { role: "system" | "user" | "assistant" | "tool"; content: string; tool_call_id?: string; tool_calls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> };
 export type ChatUsage = { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
 const baseUrl = (process.env.OPENAI_BASE_URL ?? "http://127.0.0.1:9931").replace(/\/+$/, "");
 const endpoint = `${baseUrl}/v1/chat/completions`;
@@ -52,14 +53,18 @@ export async function streamOpenAI(
   onServerStarting: (waitSeconds: number) => void | Promise<void> = (waitSeconds) => { stdout.write(`\nLLMサーバーを起動しています。${waitSeconds}秒待って再試行します…\n`); },
   onUsage: (usage: ChatUsage) => void = () => undefined,
   onReasoning: (text: string) => void | Promise<void> = () => undefined,
+  tools: OpenAITool[] = [],
+  executeTool: (name: string, args: unknown) => Promise<unknown> = async () => { throw new Error("MCP tool executor is not configured."); },
 ): Promise<string> {
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (apiKey) headers.authorization = `Bearer ${apiKey}`;
   const request = () => fetch(endpoint, {
     method: "POST", headers,
-    body: JSON.stringify({ model, messages, stream: true, stream_options: { include_usage: true } }),
+    body: JSON.stringify({ model, messages, stream: true, stream_options: { include_usage: true }, ...(tools.length ? { tools, tool_choice: "auto" } : {}) }),
     signal: AbortSignal.timeout(600_000),
   });
+  let retries = 0;
+  while (true) {
   let response = await request();
   if (response.status === 503) {
     const errorBody = await response.text();
@@ -81,6 +86,7 @@ export async function streamOpenAI(
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let pending = "", answer = "", finished = false;
+  const calls = new Map<number, { id: string; name: string; arguments: string }>();
   while (!finished) {
     const part = await reader.read();
     pending += decoder.decode(part.value, { stream: !part.done });
@@ -92,11 +98,18 @@ export async function streamOpenAI(
       if (data === "[DONE]") { finished = true; break; }
       if (!data) continue;
       const chunk = JSON.parse(data) as {
-        choices?: Array<{ delta?: { content?: string; reasoning_content?: string } }>;
+        choices?: Array<{ delta?: { content?: string; reasoning_content?: string; tool_calls?: Array<{ index: number; id?: string; function?: { name?: string; arguments?: string } }> } }>;
         usage?: ChatUsage | null;
       };
       if (chunk.usage) onUsage(chunk.usage);
       const delta = chunk.choices?.[0]?.delta;
+      for (const call of delta?.tool_calls ?? []) {
+        const current = calls.get(call.index) ?? { id: "", name: "", arguments: "" };
+        if (call.id) current.id += call.id;
+        if (call.function?.name) current.name += call.function.name;
+        if (call.function?.arguments) current.arguments += call.function.arguments;
+        calls.set(call.index, current);
+      }
       if (delta?.reasoning_content) await onReasoning(delta.reasoning_content);
       if (delta?.content) {
         answer += delta.content;
@@ -105,7 +118,22 @@ export async function streamOpenAI(
     }
     if (part.done) break;
   }
+  if (calls.size) {
+    if (!tools.length || retries++ >= 8) throw new Error("MCP tool-callの上限に達したか、ツールが未設定です。");
+    const toolCalls = [...calls.entries()].sort(([a], [b]) => a - b).map(([, call]) => ({
+      id: call.id, type: "function" as const, function: { name: call.name, arguments: call.arguments },
+    }));
+    messages.push({ role: "assistant", content: answer, tool_calls: toolCalls });
+    for (const call of toolCalls) {
+      let result: unknown;
+      try { result = await executeTool(call.function.name, JSON.parse(call.function.arguments || "{}")); }
+      catch (error) { result = { error: error instanceof Error ? error.message : String(error) }; }
+      messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
+    }
+    continue;
+  }
   return answer;
+  }
 }
 
 export const openAISettings = { baseUrl, get model() { return model; }, startupWaitSeconds };

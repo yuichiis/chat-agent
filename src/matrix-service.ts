@@ -14,6 +14,7 @@ import { logger as matrixGlobalLogger } from "../node_modules/matrix-js-sdk/lib/
 import { RelationType } from "../node_modules/matrix-js-sdk/lib/@types/event.js";
 import type { ChatMessage, ChatUsage } from "./openai.js";
 import { listOpenAIModels, loadSystemPrompt, openAISettings, setOpenAIModel, streamOpenAI } from "./openai.js";
+import { callMcpTool, startMcpServers, stopMcpServers, type OpenAITool } from "./mcp.js";
 
 const homeserver = (process.env.MATRIX_HOMESERVER_URL ?? "https://matrix.org").replace(/\/+$/, "");
 const dataDir = resolve(dirname(fileURLToPath(import.meta.url)), "../data");
@@ -298,6 +299,9 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
   const debug = options.debug ?? false;
   const serviceStartedAt = Date.now();
   const systemPrompt = await loadSystemPrompt();
+  let mcpTools: OpenAITool[] = [];
+  try { mcpTools = await startMcpServers(); }
+  catch (error) { console.error(error instanceof Error ? error.message : String(error)); throw error; }
   filterSdkConsole(debug);
   (matrixGlobalLogger as unknown as { setLevel(level: string): void }).setLevel(debug ? "debug" : "warn");
   const sdkLogger = createSdkLogger(debug);
@@ -531,7 +535,7 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
           reasoningText += text;
           if (!progressEventId) await updateProgress("考え中...", true);
           else if (!contentStarted) await updateProgress(`考え中...\n${reasoningText.slice(-3_000)}`);
-        });
+        }, mcpTools, callMcpTool);
         if (!answer) throw new Error("LLMの応答に本文がありません。");
         if (progressEventId) {
           const updated = await updateProgress(answer, true);
@@ -668,6 +672,7 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
     client.stopClient();
     await tokenWriteQueue;
     await persistCrypto();
+    await stopMcpServers();
     process.exit(0);
   };
   process.once("SIGINT", stop);
