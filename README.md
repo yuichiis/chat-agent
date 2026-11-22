@@ -14,7 +14,7 @@ npm.cmd install
 npm.cmd start
 ```
 
-Use `/new` to reset conversation history, `/model` to list models, `/model <model-id>` to switch models, `/stop` to cancel generation, and `/exit` to quit. `/stop` can be entered while the LLM is generating or calling an MCP tool.
+Use `/new` to reset conversation history, `/status` to show the selected model and latest token usage, `/model` to list models, `/model <model-id>` to switch models, `/stop` to cancel generation, and `/exit` to quit. `/stop` can be entered while the LLM is generating or calling an MCP tool.
 
 Use `npm.cmd start -- tui --debug` to print HTTP status and every raw streaming response chunk while diagnosing LLM output. The Matrix service also accepts `npm.cmd run service -- --debug`.
 

@@ -50,7 +50,6 @@ export async function listOpenAIModels(
   let response = await request();
   if (response.status === 503) {
     const errorBody = await response.text();
-    onDebug(`[LLM HTTP body] ${errorBody}`);
     let noUpstreamsAvailable = false;
     try { noUpstreamsAvailable = (JSON.parse(errorBody) as { error?: unknown }).error === "no upstreams available"; }
     catch { /* return the original server error below */ }
@@ -114,6 +113,7 @@ export async function streamOpenAI(
   onDebug(`[LLM HTTP] ${response.status} ${response.statusText}`);
   if (response.status === 503) {
     const errorBody = await response.text();
+    onDebug(`[LLM HTTP body] ${errorBody}`);
     let noUpstreamsAvailable = false;
     try {
       const payload = JSON.parse(errorBody) as { error?: unknown };

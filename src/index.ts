@@ -1,6 +1,6 @@
 import readline from "node:readline/promises";
 import { stdin, stdout } from "node:process";
-import { listOpenAIModels, loadSystemPrompt, openAISettings, setOpenAIModel, streamOpenAI, type ChatMessage } from "./openai.js";
+import { listOpenAIModels, loadSystemPrompt, openAISettings, setOpenAIModel, streamOpenAI, type ChatMessage, type ChatUsage } from "./openai.js";
 import { runMatrixService } from "./matrix-service.js";
 import { callMcpTool, startMcpServers, stopMcpServers } from "./mcp.js";
 
@@ -11,6 +11,7 @@ async function runTui(options: { debug?: boolean } = {}) {
   const mcpTools = await startMcpServers();
   const rl = readline.createInterface({ input: stdin, output: stdout, terminal: true });
   const history: ChatMessage[] = [];
+  let lastUsage: ChatUsage | undefined;
   const systemPrompt = await loadSystemPrompt();
   history.push({ role: "system", content: systemPrompt });
   const queuedLines: string[] = [];
@@ -45,7 +46,7 @@ async function runTui(options: { debug?: boolean } = {}) {
     return new Promise((resolveLine) => { inputResolver = resolveLine; });
   };
   stdout.write(`${cyan("OpenAI-compatible TUI Chat")} ${dim(`${openAISettings.baseUrl} · ${openAISettings.model}`)}\n`);
-  stdout.write(`${dim("/new 履歴消去 · /model モデル一覧・切り替え · /stop 生成中止 · /exit 終了")}\n\n`);
+  stdout.write(`${dim("/new 履歴消去 · /status 使用状況 · /model モデル一覧・切り替え · /stop 生成中止 · /exit 終了")}\n\n`);
   try {
     while (true) {
       stdout.write(cyan("you › "));
@@ -54,8 +55,16 @@ async function runTui(options: { debug?: boolean } = {}) {
       const input = line.trim();
       if (!input) continue;
       if (input === "/exit" || input === "/quit") break;
-      if (input.toLowerCase() === "/new") { history.splice(1); stdout.write(dim("会話履歴をリセットしました。\n")); continue; }
+      if (input.toLowerCase() === "/new") { history.splice(1); lastUsage = undefined; stdout.write(dim("会話履歴をリセットしました。\n")); continue; }
       if (input.toLowerCase() === "/stop") { stdout.write(dim("実行中の生成はありません。\n")); continue; }
+      if (input.toLowerCase() === "/status") {
+        const usageLine = lastUsage
+          ? `直近のLLMレスポンス: prompt_tokens=${lastUsage.prompt_tokens ?? "不明"}, completion_tokens=${lastUsage.completion_tokens ?? "不明"}, total_tokens=${lastUsage.total_tokens ?? "不明"}`
+          : "LLMトークン使用量: まだ取得できていません。";
+        const historyCount = Math.max(0, history.length - 1);
+        stdout.write(`モデル: ${openAISettings.model}\n${usageLine}\n会話履歴: ${historyCount}メッセージ（system promptを除く）\n最大コンテキスト長はLLM APIから取得できません。\n`);
+        continue;
+      }
       if (/^\/model(?:\s|$)/iu.test(input)) {
         const argument = input.slice("/model".length).trim();
         if (!argument) {
@@ -74,7 +83,7 @@ async function runTui(options: { debug?: boolean } = {}) {
         }
         continue;
       }
-      if (input.startsWith("/")) { stdout.write(dim("コマンド: /new, /model [model-id], /stop, /exit\n")); continue; }
+      if (input.startsWith("/")) { stdout.write(dim("コマンド: /new, /status, /model [model-id], /stop, /exit\n")); continue; }
       const historyStartLength = history.length;
       history.push({ role: "user", content: input });
       const controller = new AbortController();
@@ -86,7 +95,7 @@ async function runTui(options: { debug?: boolean } = {}) {
           history,
           (text) => { stdout.write(text); },
           undefined,
-          undefined,
+          (usage) => { lastUsage = usage; },
           (text) => {
             if (!reasoningLabelShown) { stdout.write(`\n${dim("[reasoning] ")}`); reasoningLabelShown = true; }
             stdout.write(text);
