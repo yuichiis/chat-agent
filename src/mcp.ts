@@ -13,7 +13,13 @@ export type OpenAITool = { type: "function"; function: { name: string; descripti
 export async function startMcpServers(configPath = resolve(process.cwd(), "config/mcp.json")): Promise<OpenAITool[]> {
   let parsed: { mcpServers?: Record<string, ServerConfig> };
   try { parsed = JSON.parse(await readFile(configPath, "utf8")); }
-  catch (error) { throw new Error(`MCP設定を読み込めません (${configPath}): ${error instanceof Error ? error.message : String(error)}`); }
+  catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      console.log(`MCP設定が見つからないため、MCPサーバーなしで起動します: ${configPath}`);
+      return [];
+    }
+    throw new Error(`MCP設定を読み込めません (${configPath}): ${error instanceof Error ? error.message : String(error)}`);
+  }
   for (const [serverName, config] of Object.entries(parsed.mcpServers ?? {})) {
     if (!config.command) throw new Error(`MCPサーバー ${serverName} にcommandがありません。`);
     const client = new Client({ name: "openai-compatible-chat-agent", version: "0.1.0" });
