@@ -44,6 +44,24 @@ function containsUserIdMention(text: string, userId: string): boolean {
   return false;
 }
 
+function describeError(error: unknown): string {
+  const parts: string[] = [];
+  let current: unknown = error;
+  const visited = new Set<unknown>();
+  while (current && typeof current === "object" && !visited.has(current)) {
+    visited.add(current);
+    const item = current as { name?: unknown; message?: unknown; code?: unknown; cause?: unknown };
+    const detail = [
+      typeof item.name === "string" ? item.name : undefined,
+      typeof item.message === "string" ? item.message : String(current),
+      typeof item.code === "string" ? `code=${item.code}` : undefined,
+    ].filter(Boolean).join(": ");
+    parts.push(detail);
+    current = item.cause;
+  }
+  return parts.join(" <- ") || String(error);
+}
+
 function requestResult<T>(request: IDBRequest<T>): Promise<T> {
   return new Promise((resolveRequest, rejectRequest) => {
     request.addEventListener("success", () => resolveRequest(request.result), { once: true });
@@ -416,15 +434,19 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
     }
 
     const prior = queues.get(room.roomId) ?? Promise.resolve();
+    let taskStage = "キュー待ち";
     const task = prior.then(async () => {
+      taskStage = "イベント確認";
       if (!eventId) {
         console.warn(`[${room.name || room.roomId}] event IDがないため処理をスキップしました。`);
         return;
       }
+      taskStage = "既存👀リアクションの確認";
       if (await hasOwnEyesReaction(room.roomId, eventId)) {
         console.log(`[${room.name || room.roomId}] 既に👀リアクションがあるためスキップしました。`);
         return;
       }
+      taskStage = "👀リアクションの送信";
       await client.sendEvent(room.roomId, EventType.Reaction, {
         "m.relates_to": { rel_type: RelationType.Annotation, event_id: eventId, key: "👀" },
       });
@@ -432,6 +454,7 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
       console.log(`[${room.name || room.roomId}] ${joinedMemberCount}人 · ${event.getSender()}: ${prompt}`);
       const commandInput = prompt.trimStart();
       if (commandInput.startsWith("/")) {
+        taskStage = "Matrixコマンドの返信";
         const command = commandInput.split(/\s/u, 1)[0].toLowerCase();
         let commandReply: string;
         if (command === "/new") {
@@ -484,6 +507,27 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
       const typingTimeoutMs = 30_000;
       let typingStarted = false;
       let typingRefresh: NodeJS.Timeout | undefined;
+      let typingRefreshFailures = 0;
+      const scheduleTypingRefresh = () => {
+        if (!typingStarted) return;
+        typingRefresh = setTimeout(() => {
+          typingRefresh = undefined;
+          void (async () => {
+            try {
+              await client.sendTyping(room.roomId, true, typingTimeoutMs);
+              if (typingRefreshFailures > 0) console.log(`[${room.name || room.roomId}] 入力中表示が復旧しました。`);
+              typingRefreshFailures = 0;
+            } catch (error) {
+              typingRefreshFailures++;
+              if (typingRefreshFailures === 1 || typingRefreshFailures % 5 === 0) {
+                console.warn(`[${room.name || room.roomId}] 入力中表示の更新に失敗しました (${typingRefreshFailures}回連続): ${describeError(error)}`);
+              }
+            } finally {
+              scheduleTypingRefresh();
+            }
+          })();
+        }, 20_000);
+      };
       let progressEventId: string | undefined;
       let progressBody: string | undefined;
       let progressTimer: NodeJS.Timeout | undefined;
@@ -563,14 +607,11 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
         try {
           await client.sendTyping(room.roomId, true, typingTimeoutMs);
           typingStarted = true;
-          typingRefresh = setInterval(() => {
-            void client.sendTyping(room.roomId, true, typingTimeoutMs).catch((error: unknown) => {
-              console.warn(`[${room.name || room.roomId}] 入力中表示の更新に失敗しました: ${error instanceof Error ? error.message : String(error)}`);
-            });
-          }, 20_000);
+          scheduleTypingRefresh();
         } catch (error) {
-          console.warn(`[${room.name || room.roomId}] 入力中表示を開始できません: ${error instanceof Error ? error.message : String(error)}`);
+          console.warn(`[${room.name || room.roomId}] 入力中表示を開始できません: ${describeError(error)}`);
         }
+        taskStage = "LLM生成とMatrix返信";
         const answer = await streamOpenAI(history, async (text) => {
           streamedAnswer += text;
           if (progressEventId) {
@@ -618,7 +659,7 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
         history.push({ role: "assistant", content: answer });
         console.log("  -> replied");
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
+        const message = describeError(error);
         if (abortController.signal.aborted) {
           history.splice(historyStartLength);
           console.log(`[${room.name || room.roomId}] LLM生成を/stopで中止しました。`);
@@ -637,15 +678,16 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
       } finally {
         if (activeRequests.get(room.roomId) === abortController) activeRequests.delete(room.roomId);
         if (progressTimer) clearTimeout(progressTimer);
-        if (typingRefresh) clearInterval(typingRefresh);
+        if (typingRefresh) clearTimeout(typingRefresh);
         if (typingStarted) {
+          typingStarted = false;
           await client.sendTyping(room.roomId, false, typingTimeoutMs).catch((error: unknown) => {
-            console.warn(`[${room.name || room.roomId}] 入力中表示の解除に失敗しました: ${error instanceof Error ? error.message : String(error)}`);
+            console.warn(`[${room.name || room.roomId}] 入力中表示の解除に失敗しました: ${describeError(error)}`);
           });
         }
       }
     }).catch((error: unknown) => {
-      console.error(`[${room.name || room.roomId}] メッセージ処理に失敗しました: ${error instanceof Error ? error.message : String(error)}`);
+      console.error(`[${room.name || room.roomId}] メッセージ処理に失敗しました (${taskStage}): ${describeError(error)}`);
     });
     queues.set(room.roomId, task);
   };
