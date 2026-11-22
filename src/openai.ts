@@ -27,15 +27,21 @@ if (maxToolRounds !== configuredMaxToolRounds) {
 }
 
 export async function loadSystemPrompt(): Promise<string> {
-  if (process.env.SYSTEM_PROMPT !== undefined) return process.env.SYSTEM_PROMPT;
+  if (process.env.SYSTEM_PROMPT !== undefined) {
+    console.log("システムプロンプト: SYSTEM_PROMPT 環境変数から読み込みました。");
+    return process.env.SYSTEM_PROMPT;
+  }
   const promptFile = process.env.SYSTEM_PROMPT_FILE;
   if (promptFile) {
     try {
-      return await readFile(resolve(process.cwd(), promptFile), "utf8");
+      const prompt = await readFile(resolve(process.cwd(), promptFile), "utf8");
+      console.log(`システムプロンプト: SYSTEM_PROMPT_FILE のファイルから読み込みました (${promptFile})。`);
+      return prompt;
     } catch (error) {
       throw new Error(`SYSTEM_PROMPT_FILE を読み込めません (${promptFile}): ${error instanceof Error ? error.message : String(error)}`);
     }
   }
+  console.log("システムプロンプト: 組み込みの既定値を使用します。");
   return defaultSystemPrompt;
 }
 
