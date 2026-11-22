@@ -50,6 +50,7 @@ export async function listOpenAIModels(
   let response = await request();
   if (response.status === 503) {
     const errorBody = await response.text();
+    onDebug(`[LLM HTTP body] ${errorBody}`);
     let noUpstreamsAvailable = false;
     try { noUpstreamsAvailable = (JSON.parse(errorBody) as { error?: unknown }).error === "no upstreams available"; }
     catch { /* return the original server error below */ }
@@ -83,6 +84,7 @@ export async function streamOpenAI(
   executeTool: (name: string, args: unknown, signal?: AbortSignal) => Promise<unknown> = async () => { throw new Error("MCP tool executor is not configured."); },
   onToolCall: (event: ToolCallEvent) => void | Promise<void> = () => undefined,
   signal?: AbortSignal,
+  onDebug: (message: string) => void = () => undefined,
 ): Promise<string> {
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (apiKey) headers.authorization = `Bearer ${apiKey}`;
@@ -109,6 +111,7 @@ export async function streamOpenAI(
   let retries = 0;
   while (true) {
   let response = await request();
+  onDebug(`[LLM HTTP] ${response.status} ${response.statusText}`);
   if (response.status === 503) {
     const errorBody = await response.text();
     let noUpstreamsAvailable = false;
@@ -132,11 +135,16 @@ export async function streamOpenAI(
         if (signal?.aborted) onAbort();
       });
       response = await request();
+      onDebug(`[LLM HTTP retry] ${response.status} ${response.statusText}`);
     } else {
       throw new Error(`OpenAI API HTTP 503: ${errorBody}`);
     }
   }
-  if (!response.ok) throw new Error(`OpenAI API HTTP ${response.status}: ${await response.text()}`);
+  if (!response.ok) {
+    const errorBody = await response.text();
+    onDebug(`[LLM HTTP body] ${errorBody}`);
+    throw new Error(`OpenAI API HTTP ${response.status}: ${errorBody}`);
+  }
   if (!response.body) throw new Error("レスポンス本文がありません。");
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -161,9 +169,15 @@ export async function streamOpenAI(
     } finally {
       if (idleTimer) clearTimeout(idleTimer);
     }
-    pending += decoder.decode(part.value, { stream: !part.done });
-    const lines = pending.split(/\r?\n/);
+    const rawChunk = decoder.decode(part.value, { stream: !part.done });
+    if (rawChunk) onDebug(`[LLM SSE chunk] ${JSON.stringify(rawChunk)}`);
+    pending += rawChunk;
+    let lines = pending.split(/\r?\n/);
     pending = lines.pop() ?? "";
+    if (part.done && pending) {
+      lines = [...lines, pending];
+      pending = "";
+    }
     for (const line of lines) {
       if (!line.startsWith("data:")) continue;
       const data = line.slice(5).trim();

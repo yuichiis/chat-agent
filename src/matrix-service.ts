@@ -607,7 +607,7 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
             console.log(`[${room.name || room.roomId}] ${notice}`);
             await updateProgress(`${notice}\n考え中...`, true);
           }
-        }, abortController.signal);
+        }, abortController.signal, debug ? (message) => console.log(`[${room.name || room.roomId}] ${message}`) : undefined);
         if (!answer) throw new Error("LLMの応答に本文がありません。");
         if (progressEventId) {
           const updated = await updateProgress(answer, true);

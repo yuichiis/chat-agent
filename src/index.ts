@@ -7,7 +7,7 @@ import { callMcpTool, startMcpServers, stopMcpServers } from "./mcp.js";
 const cyan = (s: string) => `\u001b[36m${s}\u001b[0m`;
 const dim = (s: string) => `\u001b[2m${s}\u001b[0m`;
 
-async function runTui() {
+async function runTui(options: { debug?: boolean } = {}) {
   const mcpTools = await startMcpServers();
   const rl = readline.createInterface({ input: stdin, output: stdout, terminal: true });
   const history: ChatMessage[] = [];
@@ -98,6 +98,7 @@ async function runTui() {
             stdout.write(`\n${dim(`[tool ${label}] ${event.name}${event.detail ? `: ${event.detail}` : ` ${JSON.stringify(event.args)}`}`)}\n`);
           },
           controller.signal,
+          options.debug ? (message) => { stdout.write(`\n${dim(message)}\n`); } : undefined,
         );
         history.push({ role: "assistant", content: answer });
       } catch (error) {
@@ -118,5 +119,5 @@ async function runTui() {
 
 const mode = process.argv[2] ?? "tui";
 if (mode === "service") await runMatrixService({ debug: process.argv.includes("--debug") });
-else if (mode === "tui") await runTui();
+else if (mode === "tui") await runTui({ debug: process.argv.includes("--debug") });
 else { console.error("使い方: npm start -- [tui|service] [--debug]"); process.exitCode = 2; }
