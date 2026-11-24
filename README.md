@@ -36,7 +36,7 @@ Invite the agent account shown at startup to a room, or start a direct chat with
 
 Messages sent before the current service process starts are ignored. Eligible new messages receive an `👀` reaction before processing; if the agent already reacted with `👀`, it skips that message.
 
-Matrix commands: `/new` clears that room's in-memory conversation history, `/status` reports the selected model and token usage, `/model` lists available model IDs, and `/stop` cancels the room's active generation or MCP tool call. Use `/model <model-id>` to switch models for this running service. Unknown slash commands return a command help message.
+Matrix commands: `/new` clears that room's in-memory conversation history, `/status` reports the selected model and token usage, `/model` lists available model IDs, `/switch` lists room display switches, and `/stop` cancels the room's active generation or MCP tool call. Use `/model <model-id>` to switch models, or `/switch show_reasoning on|off` and `/switch show_tool_calls on|off` to change Matrix progress details for the running service.
 
 The OAuth client registration ID is cached under `data/matrix-client.json`. Access and refresh tokens are stored in `data/matrix-session.json`, and the E2EE IndexedDB state is snapshotted to `data/matrix-crypto-<device-id>.bin`. These files are ignored by Git and created with owner-only permissions where supported. On restart, the service refreshes the saved token and restores the same encrypted device; if the refresh token is revoked or the crypto snapshot is missing, it starts device authorization again. Keep the `data` directory private and include it in backups if you need to preserve the Matrix device.
 
@@ -49,6 +49,7 @@ The OAuth client registration ID is cached under `data/matrix-client.json`. Acce
 | `OPENAI_API_KEY` | unset | Optional Bearer token for the LLM server |
 | `OPENAI_STARTUP_WAIT_SECONDS` | `120` | Seconds to wait before retrying after `503 no upstreams available` |
 | `MCP_MAX_TOOL_ROUNDS` | `8` | Maximum number of consecutive LLM tool-call rounds per user message |
+| `MEDIA_DIR` | unset | Directory containing images the Matrix service may attach when the LLM emits a `MEDIA: filename` line |
 | `SYSTEM_PROMPT` | `You are a helpful assistant.` | LLM system message |
 | `SYSTEM_PROMPT_FILE` | unset | UTF-8 file containing the system prompt; used when `SYSTEM_PROMPT` is unset |
 | `MATRIX_HOMESERVER_URL` | `https://matrix.org` | Matrix homeserver URL |

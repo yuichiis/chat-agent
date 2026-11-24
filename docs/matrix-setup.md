@@ -24,6 +24,7 @@ $env:OPENAI_BASE_URL = "http://127.0.0.1:9931"
 $env:OPENAI_MODEL = "local-model"
 $env:OPENAI_STARTUP_WAIT_SECONDS = "120"
 $env:MCP_MAX_TOOL_ROUNDS = "8"
+$env:MEDIA_DIR = "C:\\chat-agent-media"
 ```
 
 認証が必要な OpenAI 互換サーバーでは、API キーを設定します。
@@ -45,6 +46,8 @@ $env:SYSTEM_PROMPT_FILE = ".\system-prompt.txt"
 オンデマンド起動のLLMサーバーがHTTP 503と `no upstreams available` を返したときの再試行待ち時間は、`OPENAI_STARTUP_WAIT_SECONDS` で秒単位に設定できます。既定値は120秒です。0以上の整数を指定します。
 
 1回のユーザーメッセージに対してLLMが連続してMCPツールを呼び出せる上限は、`MCP_MAX_TOOL_ROUNDS`で設定します。既定値は8回で、1以上の整数を指定します。反復中に無限ループが起きた場合は、Matrixルームへ`/stop`を送ると生成を中止できます。
+
+Matrixへ投稿できる画像の置き場所は`MEDIA_DIR`で指定します。LLMが応答に単独行で`MEDIA: chart.png`のように出力すると、サービスはファイル名からディレクトリ部分を取り除き、`MEDIA_DIR`内の画像だけを読み込みます。対応形式はPNG、JPEG、GIF、WebP、BMP、TIFFです。暗号化ルームでは画像ファイルも暗号化してアップロードします。`MEDIA_DIR`が未設定なら画像投稿は無効です。
 
 ## 3. エージェント用アカウントを用意する
 
@@ -92,9 +95,9 @@ npm.cmd run service -- --debug
 
 起動前に送られた過去の投稿は読み込まれても処理しません。応答条件に合う新着投稿には、LLM処理の前にエージェントが `👀` リアクションを付けます。対象投稿にエージェント自身の `👀` が既にある場合は、重複処理を避けるため読み飛ばします。
 
-LLMの応答生成中はElementに入力中表示を送り、長時間の生成では通知を定期更新します。返信またはエラーを送った後に入力中表示を解除します。
+LLMの応答生成中はElementに入力中表示を送り、長時間の生成では通知を定期更新します。返信またはエラーを送った後に入力中表示を解除します。MCPツールの開始・完了・エラーはそれぞれ専用メッセージに表示し、開始メッセージは結果またはエラーで編集します。最終回答は別メッセージで送信します。
 
-LLM応答で`reasoning_content`が先に届いた場合、ルームに「考え中...」を表示し、同じMatrixメッセージを編集して進捗を更新します。MCPツール実行後の生成でもreasoningを同じメッセージに表示します。通常の`content`が届き始めると、そのメッセージを応答本文に置き換えて確定します。
+`show_reasoning`が`on`の場合、`reasoning_content`は専用のMatrixメッセージに表示し、生成中はそのメッセージを編集して更新します。最終回答は別のメッセージで送るため、reasoning表示は回答後も残ります。`show_reasoning`が`off`の場合、reasoning本文は送信せず通常の進捗表示だけを行います。
 
 オンデマンド起動のLLMサーバーがHTTP 503と `no upstreams available` を返した場合、ルームに起動中の案内を送り、`OPENAI_STARTUP_WAIT_SECONDS` の秒数（既定120秒）待って同じリクエストを1回再試行します。再試行も失敗した場合は通常のエラー応答になります。
 
@@ -108,8 +111,13 @@ LLM応答で`reasoning_content`が先に届いた場合、ルームに「考え�
 - `/status`: 選択中のモデル、直近LLMレスポンスの`prompt_tokens`・`completion_tokens`・`total_tokens`、会話履歴数を表示します。
 - `/model`: OpenAI互換の`/v1/models` APIからモデルID一覧を取得します。選択中のIDには印が付きます。
 - `/model <model-id>`: このサービス実行中に使うモデルを切り替えます。再起動すると`OPENAI_MODEL`の設定に戻ります。
+- `/switch`: ルームごとの表示スイッチと現在値を一覧表示します。
+- `/switch show_reasoning on|off`: reasoning本文を専用のMatrixメッセージに表示するか切り替えます。既定値は`on`です。
+- `/switch show_tool_calls on|off`: MCPツール名・引数・結果・エラーを専用メッセージに表示するか切り替えます。既定値は`on`です。`off`でも「考え中...」の進捗表示は続きます。
 - `/stop`: そのルームで実行中のLLM生成またはMCPツール呼び出しを中止します。3人以上のルームでもメンションは不要です。
 - 未知の`/`コマンド: 不明なコマンドであることと、利用可能なコマンドを返信します。
+
+表示スイッチはルームごとにサービス実行中だけ保持され、サービス再起動後は既定値に戻ります。スイッチを追加する場合は、`src/matrix-service.ts`の`switchDefinitions`に既定値と説明を加え、対応する表示箇所で値を参照します。
 
 最大コンテキスト長はLLM APIから取得できません。usageが返らない場合、`/status`はトークン数未取得と会話履歴数を表示します。
 

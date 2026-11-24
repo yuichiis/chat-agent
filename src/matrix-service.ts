@@ -15,8 +15,13 @@ import { RelationType } from "../node_modules/matrix-js-sdk/lib/@types/event.js"
 import type { ChatMessage, ChatUsage } from "./openai.js";
 import { listOpenAIModels, loadSystemPrompt, openAISettings, setOpenAIModel, streamOpenAI } from "./openai.js";
 import { callMcpTool, startMcpServers, stopMcpServers, type OpenAITool } from "./mcp.js";
+import { mediaDirectory, parseMediaDirectives, sendMatrixImage } from "./media.js";
 
 const homeserver = (process.env.MATRIX_HOMESERVER_URL ?? "https://matrix.org").replace(/\/+$/, "");
+const switchDefinitions: Record<string, { defaultValue: boolean; description: string }> = {
+  show_reasoning: { defaultValue: true, description: "reasoning本文を専用メッセージに表示" },
+  show_tool_calls: { defaultValue: true, description: "MCPツール名・引数・結果やエラーを専用メッセージに表示" },
+};
 const dataDir = resolve(dirname(fileURLToPath(import.meta.url)), "../data");
 const clientInfoPath = resolve(dataDir, "matrix-client.json");
 const sessionPath = resolve(dataDir, "matrix-session.json");
@@ -316,7 +321,10 @@ async function login(sdkLogger: Logger) {
 export async function runMatrixService(options: { debug?: boolean } = {}): Promise<void> {
   const debug = options.debug ?? false;
   const serviceStartedAt = Date.now();
-  const systemPrompt = await loadSystemPrompt();
+  const configuredSystemPrompt = await loadSystemPrompt();
+  const systemPrompt = mediaDirectory
+    ? `${configuredSystemPrompt}\n\nWhen you want to post an image in this Matrix room, end your response with a separate line in this exact format: MEDIA: filename.png. Use only the image filename, never a path. The Matrix service removes MEDIA lines from the visible reply and attaches images found in MEDIA_DIR.`
+    : configuredSystemPrompt;
   let mcpTools: OpenAITool[] = [];
   try { mcpTools = await startMcpServers(); }
   catch (error) { console.error(error instanceof Error ? error.message : String(error)); throw error; }
@@ -325,9 +333,10 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
   const sdkLogger = createSdkLogger(debug);
   console.log(`Matrix サービスを開始します (${homeserver})`);
   console.log(`LLM: ${openAISettings.baseUrl} · ${openAISettings.model}`);
+  console.log(mediaDirectory ? `画像投稿ディレクトリ: ${mediaDirectory}` : "画像投稿: 無効 (MEDIA_DIR未設定)");
   console.log(`オンデマンド起動待ち: ${openAISettings.startupWaitSeconds}秒`);
   console.log("応答条件: 参加中メンバー2人以下は他の人の投稿、3人以上はエージェントへのメンション");
-  console.log("Matrixコマンド: /new, /status, /model [model-id], /stop");
+  console.log("Matrixコマンド: /new, /status, /model [model-id], /switch [name on|off], /stop");
   console.log(debug ? "デバッグログ: 有効" : "デバッグログ: 無効（--debug で有効）");
   console.log("起動後のコマンド: /verify（この端末を認証）, /help。終了: Ctrl+C");
 
@@ -378,6 +387,34 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
   const decryptWarningAt = new Map<string, number>();
   const queues = new Map<string, Promise<void>>();
   const activeRequests = new Map<string, AbortController>();
+  const switchesByRoom = new Map<string, Map<string, boolean>>();
+  const getSwitch = (roomId: string, name: string): boolean =>
+    switchesByRoom.get(roomId)?.get(name) ?? switchDefinitions[name]?.defaultValue ?? false;
+  const progressClearers = new Map<string, () => Promise<boolean>>();
+  const handleSwitchCommand = (roomId: string, commandInput: string): { reply: string; switchedOff: boolean } => {
+    const command = commandInput.split(/\s/u, 1)[0];
+    const [rawName, rawValue, ...extra] = commandInput.slice(command.length).trim().split(/\s+/u).filter(Boolean);
+    if (!rawName) {
+      return {
+        reply: `ルームスイッチ:\n${Object.entries(switchDefinitions).map(([name, definition]) =>
+          `${name}: ${getSwitch(roomId, name) ? "on" : "off"} — ${definition.description}`,
+        ).join("\n")}\n設定: /switch <name> on|off`,
+        switchedOff: false,
+      };
+    }
+    const name = rawName.toLowerCase();
+    const value = rawValue?.toLowerCase();
+    if (!switchDefinitions[name]) {
+      return { reply: `不明なスイッチです: ${name}\n利用可能なスイッチ: ${Object.keys(switchDefinitions).join(", ")}`, switchedOff: false };
+    }
+    if ((value !== "on" && value !== "off") || extra.length > 0) {
+      return { reply: `使い方: /switch ${name} on|off`, switchedOff: false };
+    }
+    const roomSwitches = switchesByRoom.get(roomId) ?? new Map<string, boolean>();
+    roomSwitches.set(name, value === "on");
+    switchesByRoom.set(roomId, roomSwitches);
+    return { reply: `${name} を ${value} にしました。`, switchedOff: value === "off" };
+  };
   const hasOwnEyesReaction = async (roomId: string, eventId: string): Promise<boolean> => {
     let from: string | undefined;
     do {
@@ -406,6 +443,7 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
     const prompt = content.body.trim();
     if (!prompt) return;
     const isStopCommand = prompt.split(/\s/u, 1)[0].toLowerCase() === "/stop";
+    const isSwitchCommand = prompt.split(/\s/u, 1)[0].toLowerCase() === "/switch";
     const joinedMemberCount = room.getJoinedMemberCount();
     const mentionedViaMetadata = content["m.mentions"]?.user_ids?.includes(session.userId) ?? false;
     const mentionedInBody = containsUserIdMention(content.body, session.userId)
@@ -429,6 +467,21 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
         await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: notice });
       })().catch((error: unknown) => {
         console.error(`[${room.name || room.roomId}] /stopの処理に失敗しました: ${error instanceof Error ? error.message : String(error)}`);
+      });
+      return;
+    }
+    if (isSwitchCommand) {
+      const { reply, switchedOff } = handleSwitchCommand(room.roomId, prompt);
+      if (switchedOff) void progressClearers.get(room.roomId)?.();
+      void (async () => {
+        if (eventId && !(await hasOwnEyesReaction(room.roomId, eventId))) {
+          await client.sendEvent(room.roomId, EventType.Reaction, {
+            "m.relates_to": { rel_type: RelationType.Annotation, event_id: eventId, key: "👀" },
+          });
+        }
+        await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: reply });
+      })().catch((error: unknown) => {
+        console.error(`[${room.name || room.roomId}] /switchの処理に失敗しました: ${describeError(error)}`);
       });
       return;
     }
@@ -468,6 +521,8 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
             ? `直近のLLMリクエスト: prompt_tokens=${usage.prompt_tokens ?? "不明"}, completion_tokens=${usage.completion_tokens ?? "不明"}, total_tokens=${usage.total_tokens ?? "不明"}`
             : "LLMトークン使用量: まだ取得できていません。";
           commandReply = `モデル: ${openAISettings.model}\n${usageLine}\n会話履歴: ${messageCount}メッセージ（system promptを除く）\n最大コンテキスト長はLLM APIから取得できません。`;
+        } else if (command === "/switch") {
+          commandReply = handleSwitchCommand(room.roomId, commandInput).reply;
         } else if (command === "/model") {
           const argument = commandInput.slice(command.length).trim();
           if (!argument) {
@@ -492,7 +547,7 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
             commandReply = `モデルを ${openAISettings.model} に切り替えました。`;
           }
         } else {
-          commandReply = `不明なコマンドです: ${command}\n利用可能なコマンド: /new, /status, /model, /stop`;
+          commandReply = `不明なコマンドです: ${command}\n利用可能なコマンド: /new, /status, /model, /switch, /stop`;
         }
         await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: commandReply });
         console.log(`  -> ${command}`);
@@ -600,9 +655,72 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
         void drainProgress();
         return result;
       };
+      const clearProgressDetails = () => progressEventId
+        ? updateProgress("考え中...", true)
+        : Promise.resolve(true);
+      progressClearers.set(room.roomId, clearProgressDetails);
       let reasoningText = "";
+      let reasoningEventId: string | undefined;
+      let pendingReasoningBody: string | undefined;
+      let reasoningForce = false;
+      let reasoningLastUpdateAt = 0;
+      let reasoningWorker: Promise<void> | undefined;
+      const writeReasoning = async (body: string): Promise<void> => {
+        if (!reasoningEventId) {
+          const sent = await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body });
+          reasoningEventId = sent.event_id;
+        } else {
+          await client.sendMessage(room.roomId, {
+            msgtype: MsgType.Text,
+            body: `*${body}`,
+            "m.new_content": { msgtype: MsgType.Text, body },
+            "m.relates_to": { rel_type: RelationType.Replace, event_id: reasoningEventId },
+          });
+        }
+      };
+      const startReasoningWorker = (): Promise<void> => {
+        if (reasoningWorker) return reasoningWorker;
+        reasoningWorker = (async () => {
+          while (pendingReasoningBody !== undefined) {
+            const waitMs = 1_000 - (Date.now() - reasoningLastUpdateAt);
+            if (!reasoningForce && reasoningEventId && waitMs > 0) {
+              await new Promise((resolveWait) => setTimeout(resolveWait, waitMs));
+              continue;
+            }
+            const body = pendingReasoningBody;
+            pendingReasoningBody = undefined;
+            reasoningForce = false;
+            reasoningLastUpdateAt = Date.now();
+            try { await writeReasoning(body); }
+            catch (error) {
+              console.warn(`[${room.name || room.roomId}] reasoningメッセージを更新できません: ${describeError(error)}`);
+            }
+          }
+        })().finally(() => {
+          reasoningWorker = undefined;
+          if (pendingReasoningBody !== undefined) void startReasoningWorker();
+        });
+        return reasoningWorker;
+      };
+      const updateReasoning = (body: string) => {
+        pendingReasoningBody = body;
+        void startReasoningWorker();
+      };
+      const flushReasoning = async () => {
+        if (pendingReasoningBody === undefined && !reasoningWorker) return;
+        reasoningForce = true;
+        await startReasoningWorker();
+        if (pendingReasoningBody !== undefined) await flushReasoning();
+      };
       let streamedAnswer = "";
-      let contentStarted = false;
+      const writeToolEvent = async (body: string): Promise<void> => {
+        try {
+          const sent = await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body });
+          if (debug) console.log(`[${room.name || room.roomId}] tool event sent: ${sent.event_id}`);
+        } catch (error) {
+          console.warn(`[${room.name || room.roomId}] MCPツールメッセージを送信できません: ${describeError(error)}`);
+        }
+      };
       try {
         try {
           await client.sendTyping(room.roomId, true, typingTimeoutMs);
@@ -615,8 +733,10 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
         const answer = await streamOpenAI(history, async (text) => {
           streamedAnswer += text;
           if (progressEventId) {
-            contentStarted = true;
-            void updateProgress(streamedAnswer.slice(-4_000), false, false);
+            const visible = parseMediaDirectives(streamedAnswer, true).text;
+            if (visible && (!getSwitch(room.roomId, "show_reasoning") || !reasoningText)) {
+              void updateProgress(visible.slice(-4_000), false, false);
+            }
           }
         }, async (waitSeconds) => {
           const startupNotice = `LLMサーバーを起動しています。約${waitSeconds}秒後に自動で再試行します。`;
@@ -625,38 +745,85 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
             console.warn(`[${room.name || room.roomId}] 起動待ちメッセージを送信できません: ${error instanceof Error ? error.message : String(error)}`);
           });
         }, (usage) => { usageByRoom.set(room.roomId, usage); }, async (text) => {
-          reasoningText += text;
-          if (!progressEventId) await updateProgress("考え中...", true);
-          else if (!contentStarted) void updateProgress(`考え中...\n${reasoningText.slice(-3_000)}`, false, false);
+          if (!getSwitch(room.roomId, "show_reasoning")) {
+            if (!progressEventId) await updateProgress("考え中...", true);
+            return;
+          }
+          let remaining = text;
+          while (remaining.length > 0) {
+            const capacity = 3_000 - reasoningText.length;
+            reasoningText += remaining.slice(0, capacity);
+            remaining = remaining.slice(capacity);
+            updateReasoning(`考え中...\n${reasoningText}`);
+            if (reasoningText.length >= 3_000) {
+              await flushReasoning();
+              reasoningText = "";
+              reasoningEventId = undefined;
+            }
+          }
         }, mcpTools, callMcpTool, async (toolEvent) => {
-          if (toolEvent.phase !== "start") {
-            contentStarted = false;
+          if (toolEvent.phase === "start" || toolEvent.phase === "error") {
+            await flushReasoning();
             reasoningText = "";
+            reasoningEventId = undefined;
+          }
+          if (!getSwitch(room.roomId, "show_tool_calls")) {
+            await updateProgress("考え中...", true);
+            return;
           }
           if (toolEvent.phase === "error") {
             const detail = toolEvent.detail || "詳細不明";
-            const notice = `MCPツール ${toolEvent.name} でエラーが発生しました:\n${detail.slice(0, 2_000)}\n考え中...`;
+            const notice = `MCPツール ${toolEvent.name} でエラーが発生しました:\n${detail.slice(0, 2_000)}`;
             console.error(`[${room.name || room.roomId}] ${notice}`);
-            await updateProgress(notice, true);
+            await writeToolEvent(notice);
           } else if (toolEvent.phase === "start") {
             const args = JSON.stringify(toolEvent.args);
             const notice = `MCPツール実行中: ${toolEvent.name}\n引数: ${args.slice(0, 1_000)}`;
             console.log(`[${room.name || room.roomId}] ${notice}`);
-            await updateProgress(notice, true);
+            await writeToolEvent(notice);
           } else {
             const notice = `MCPツール完了: ${toolEvent.name}`;
             console.log(`[${room.name || room.roomId}] ${notice}`);
-            await updateProgress(`${notice}\n考え中...`, true);
+            await writeToolEvent(notice);
           }
         }, abortController.signal, debug ? (message) => console.log(`[${room.name || room.roomId}] ${message}`) : undefined);
-        if (!answer) throw new Error("LLMの応答に本文がありません。");
-        if (progressEventId) {
-          const updated = await updateProgress(answer, true);
-          if (!updated) await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: answer });
-        } else {
-          await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: answer });
+        await flushReasoning();
+        const deliverable = parseMediaDirectives(answer);
+        if (!deliverable.text && !deliverable.filenames.length) throw new Error("LLMの応答に本文もMEDIA指示もありません。");
+        if (deliverable.text) {
+          if (progressEventId) {
+            const updated = await updateProgress(deliverable.text, true);
+            if (!updated) await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: deliverable.text });
+          } else {
+            await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: deliverable.text });
+          }
+        } else if (progressEventId) {
+          await updateProgress("画像を投稿しています...", true);
         }
-        history.push({ role: "assistant", content: answer });
+
+        const historyAttachments: string[] = [];
+        for (const requestedName of deliverable.filenames) {
+          try {
+            const filename = await sendMatrixImage(client, room.roomId, requestedName);
+            historyAttachments.push(`画像を投稿しました: ${filename}`);
+            console.log(`[${room.name || room.roomId}] 画像を投稿しました: ${filename}`);
+          } catch (error) {
+            const reason = describeError(error);
+            const failure = `画像を投稿できませんでした (${requestedName}): ${reason}`;
+            historyAttachments.push(failure);
+            console.error(`[${room.name || room.roomId}] ${failure}`);
+            await client.sendMessage(room.roomId, { msgtype: MsgType.Text, body: failure }).catch((sendError: unknown) => {
+              console.error(`[${room.name || room.roomId}] 画像投稿エラーを通知できません: ${describeError(sendError)}`);
+            });
+          }
+        }
+        if (!deliverable.text && progressEventId) {
+          const summary = historyAttachments.every((item) => item.startsWith("画像を投稿しました:"))
+            ? "画像を投稿しました。"
+            : "画像の投稿が完了しました。詳細は上のエラーを確認してください。";
+          await updateProgress(summary, true);
+        }
+        history.push({ role: "assistant", content: [deliverable.text, ...historyAttachments].filter(Boolean).join("\n") });
         console.log("  -> replied");
       } catch (error) {
         const message = describeError(error);
@@ -677,6 +844,7 @@ export async function runMatrixService(options: { debug?: boolean } = {}): Promi
         }
       } finally {
         if (activeRequests.get(room.roomId) === abortController) activeRequests.delete(room.roomId);
+        if (progressClearers.get(room.roomId) === clearProgressDetails) progressClearers.delete(room.roomId);
         if (progressTimer) clearTimeout(progressTimer);
         if (typingRefresh) clearTimeout(typingRefresh);
         if (typingStarted) {

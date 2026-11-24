@@ -17,6 +17,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
     "fake-indexeddb": "^6.2.8",
+    "matrix-encrypt-attachment": "^1.0.3",
     "matrix-js-sdk": "^45.1.0"
   }
 }
